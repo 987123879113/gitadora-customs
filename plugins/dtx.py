@@ -4,44 +4,6 @@
 
 # Auto lane override details: https://osdn.net/projects/dtxmania/ticket/26338
 
-# Unsupported DTX commands:
-# GENRE
-# COMMENT
-# PANEL
-# HIDDENLEVEL
-# STAGEFILE
-# PREMOVIE
-# BACKGROUND
-# BACKGROUND_GR
-# WALL
-# BMP
-# SOUND_NOWLOADING
-# SOUND_STAGEFAILED
-# SOUND_FULLCOMBO
-# SOUND_AUDIENCE
-# RESULTIMAGE
-# RESULTIMAGE_xx
-# RESULTMOVIE
-# RESULTMOVIE_xx
-# RESULTSOUND
-# RESULTSOUND_xx
-# SIZEzz
-# BMPzz
-# BMPTEXzz
-# BGAzz
-# BGAPANzz
-# AVIzz
-# VIDEOzz
-# AVIPANzz
-# MIDINOTE
-# RANDOM
-# IF
-# DTXVPLAYSPEED
-# USE556X710BGAAVI
-# MIDIFILE
-# BLACKCOLORKEY
-
-
 import copy
 from fractions import Fraction
 import json
@@ -63,6 +25,7 @@ dtx_bonus_mapping = {
     "floortom": 0x08,
     "rightcymbal": 0x09,
 }
+reverse_dtx_bonus_mapping = {dtx_bonus_mapping[k]: k for k in dtx_bonus_mapping if k != "auto"}
 
 drum_mapping = {
     "hihat": 0x11,
@@ -207,1439 +170,414 @@ bass_range = list(range(0xa0, 0xa7 + 1)) + \
     list(range(0xda, 0xe8 + 1))
 
 
-# This is similar to Fraction, except it won't
-# try to reduce the fraction.
-class Fraction2:
-    numerator = 4
-    denominator = 4
-    denominator_orig = 2
-
-    def __init__(self, numerator, denominator):
-        self.numerator = numerator
-        self.denominator = denominator
-
-        bits = "{0:b}".format(denominator)
-
-        if len(bits.replace("0","")) > 1:
-            print("Denominator %d is not a valid power of 2" % denominator)
-            exit(1)
-
-        if '1' in bits:
-            self.denominator_orig = len(bits) - 1
-        else:
-            self.denominator_orig = 0
-
-
-    def __str__(self):
-        return "%d/%d" % (self.numerator, self.denominator)
-
-
-########################
-#   DTX reading code   #
-########################
-
-def get_value_from_dtx(target_tag, lines, default=None):
-    for line in lines:
-        matches = re.match(r"#(?P<tag>[A-Za-z0-9]+):?\s*(?P<value>.*)", line)
-
-        if not matches:
-            continue
-
-        tag = matches.group('tag').upper()
-        value = matches.group('value')
-
-        if tag.startswith(target_tag):
-            return value
-
-    return default
-
-
-def get_bpms_from_dtx(lines):
-    bpms = {}
-    base_bpm = 0
-
-    for line in lines:
-        matches = re.match(r"#(?P<tag>[A-Za-z0-9]+):?\s*(?P<value>.*)", line)
-
-        if not matches:
-            continue
-
-        tag = matches.group('tag').upper()
-        value = matches.group('value')
-
-        if tag.startswith("BPM"):
-            matches2 = re.match("BPM(?P<id>[0-9A-Z]{2})?", tag)
-
-            if not matches2:
-                pass
-
-            bpm_id = matches2.group('id')
-
-            if bpm_id:
-                bpm_id = int(bpm_id, 36)
-            else:
-                bpm_id = 0
-
-            bpms[bpm_id] = float(value)
-
-        elif tag.startswith("BASEBPM"):
-            base_bpm = float(value)
-
-    return bpms, base_bpm
-
-
-def get_wavs_from_dtx(lines, target_parts, sound_metadata, get_wav_length=True):
-    wav_filenames = {}
-    wav_lengths = {}
-
-    for line in lines:
-        if ';' in line:
-            line = line[:line.index(';')].strip()
-
-        matches = re.match(r"#(?P<tag>[A-Za-z0-9]+):?\s*(?P<value>.*)", line)
-
-        if not matches:
-            continue
-
-        tag = matches.group('tag').upper()
-        value = matches.group('value')
-
-        if tag.startswith("WAV") and not tag.startswith("WAVPAN") and not tag.startswith("WAVVOL"):
-            # Handle WAV tags
-            # This can be exported for use by va3 creator
-
-            matches2 = re.match("WAV(?P<id>[0-9A-Z]{2})?", tag)
-
-            if not matches2:
-                pass
-
-            wav_id = matches2.group('id')
-
-            if wav_id:
-                wav_id = int(wav_id, 36)
-            else:
-                wav_id = 0
-
-            wav_filenames[wav_id] = os.sep.join(value.split('\\'))
-
-            if get_wav_length and ('guitar' in target_parts or 'bass' in target_parts or 'open' in target_parts):
-                duration = audio.get_duration(os.path.join(sound_metadata['sound_folder'], value))
-                wav_lengths[wav_id] = int(round(duration * 300))
-            else:
-                wav_lengths[wav_id] = 0
-
-    return wav_filenames, wav_lengths
-
-
-def get_wav_volumes_from_dtx(lines):
-    wav_volumes = {}
-
-    for line in lines:
-        matches = re.match(r"#(?P<tag>[A-Za-z0-9]+):?\s*(?P<value>.*)", line)
-
-        if not matches:
-            continue
-
-        tag = matches.group('tag').upper()
-        value = matches.group('value')
-
-        if tag.startswith("VOLUME"):
-            valid_tag = "VOLUME"
-        elif tag.startswith("WAVVOL"):
-            valid_tag = "WAVVOL"
-        else:
-            valid_tag = None
-
-        if valid_tag:
-            # Handle VOLUME tags
-            # This can be exported for use by va3 creator
-
-            matches2 = re.match(valid_tag + "(?P<id>[0-9A-Z]{2})?", tag)
-
-            if not matches2:
-                pass
-
-            vol_id = matches2.group('id')
-
-            if vol_id:
-                vol_id = int(vol_id, 36)
-            else:
-                vol_id = 0
-
-            wav_volumes[vol_id] = int(value)
-
-    return wav_volumes
-
-
-def get_wav_pans_from_dtx(lines):
-    wav_pans = {}
-
-    for line in lines:
-        matches = re.match(r"#(?P<tag>[A-Za-z0-9]+):?\s*(?P<value>.*)", line)
-
-        if not matches:
-            continue
-
-        tag = matches.group('tag').upper()
-        value = matches.group('value')
-
-        if tag.startswith("PAN"):
-            valid_tag = "PAN"
-        elif tag.startswith("WAVPAN"):
-            valid_tag = "WAVPAN"
-        else:
-            valid_tag = None
-
-
-        if valid_tag:
-            # Handle PAN tags
-            # This can be exported for use by va3 creator
-
-            matches2 = re.match(valid_tag + "(?P<id>[0-9A-Z]{2})?", tag)
-
-            if not matches2:
-                pass
-
-            pan_id = matches2.group('id')
-
-            if pan_id:
-                pan_id = int(pan_id, 36)
-            else:
-                pan_id = 0
-
-            wav_pans[pan_id] = int(value)
-
-    return wav_pans
-
-
-def get_bonus_notes_from_dtx(lines, start_offset_padding):
-    bonus_notes = {}
-
-    for line in lines:
-        matches = re.match(r"#(?P<tag>[A-Za-z0-9]+):?\s*(?P<value>.*)", line)
-
-        if not matches:
-            continue
-
-        tag = matches.group('tag').upper()
-        value = matches.group('value')
-
-        if tag[0].isdigit():
-            matches2 = re.match("(?P<measure>[0-9]{3})(?P<event>[0-9A-F]{2})", tag)
-
-            if not matches2:
-                pass
-
-            measure = int(matches2.group('measure')) + start_offset_padding
-            event = int(matches2.group('event'), 16)
-
-            if event in [0x4c, 0x4d, 0x4e, 0x4f]:  # Bonus notes
-                data = [value[i:i+2] for i in range(0, len(value), 2)]
-                for i in range(len(data)):
-                    if measure not in bonus_notes:
-                        bonus_notes[measure] = {}
-
-                    if i not in bonus_notes[measure]:
-                        bonus_notes[measure][i] = []
-
-                    bonus_notes[measure][i].append(int(data[i], 36))
-
-    return bonus_notes
-
-
-def get_measure_lengths_from_dtx(lines, start_offset_padding):
-    VALID_TIMESIG_DENOMINATORS = [1 << x for x in range(0, 256)]
-
-    measure_lengths = {}
-
-    for line in lines:
-        matches = re.match(r"#(?P<tag>[A-Za-z0-9]+):?\s*(?P<value>.*)", line)
-
-        if not matches:
-            continue
-
-        tag = matches.group('tag').upper()
-        value = matches.group('value')
-
-        if tag[0].isdigit():
-            matches2 = re.match("(?P<measure>[0-9]{3})(?P<event>[0-9A-F]{2})", tag)
-
-            if not matches2:
-                pass
-
-            measure = int(matches2.group('measure')) + start_offset_padding
-            event = int(matches2.group('event'), 16)
-
-            if event != 0x02:
-                continue
-
-            # Measure length event
-            f1 = Fraction(float(value)).limit_denominator()
-            numerator = f1.numerator
-            denominator = f1.denominator
-
-            # How to code this?
-            if denominator == 1:
-                numerator *= 4
-                denominator = 4
-            elif denominator == 2:
-                numerator *= 2
-                denominator = 4
-
-            f2 = Fraction2(numerator, denominator)
-
-            # Add check for impossible time signatures
-            if denominator not in VALID_TIMESIG_DENOMINATORS:
-                print("ERROR: This is an impossible to represent"
-                      "time signature: {}".format(value))
-                print("This came out to be", f2)
-                print("Valid denominators for the time signature"
-                      "must be a power of two...", VALID_TIMESIG_DENOMINATORS[:12])
-                print("Please try simplifying all measures which"
-                      "use the measure length {}".format(value))
-                exit(1)
-
-            measure_lengths[measure] = f2
-
-    if 0 not in measure_lengths:
-        measure_lengths[0] = Fraction2(4, 4)  # Default to 4/4
-
-    return measure_lengths
-
-
-def get_events_by_measure_from_dtx(lines, start_offset_padding):
-    events_by_measure = {}
-
-    for line in lines:
-        matches = re.match(r"#(?P<tag>[A-Za-z0-9]+):?\s*(?P<value>.*)", line)
-
-        if not matches:
-            continue
-
-        tag = matches.group('tag').upper()
-        value = matches.group('value')
-
-        if tag[0].isdigit():
-            matches2 = re.match("(?P<measure>[0-9]{3})(?P<event>[0-9A-F]{2})", tag)
-
-            if not matches2:
-                pass
-
-            measure = int(matches2.group('measure')) + start_offset_padding
-            event = int(matches2.group('event'), 16)
-
-            if event == 0x02:
-                continue
-
-            # Handle specific events
-            if measure not in events_by_measure:
-                events_by_measure[measure] = {}
-
-            events_by_measure[measure][event] = [value[i:i+2] for i in range(0, len(value), 2)]
-
-    return events_by_measure
-
-
-def pad_events(events_by_measure, measure_lengths):
-    # Pad all measures to appropriate sizes
-    for measure in events_by_measure:
-        for event in events_by_measure[measure]:
-            scale = Fraction(4, 4)
-
-            measure_lengths_keys = sorted(measure_lengths.keys(), key=lambda x: int(x))
-            matched_measures = [x for x in measure_lengths_keys if int(x) <= measure]
-
-            if len(matched_measures) > 0:
-                scale = measure_lengths[matched_measures[-1]]
-
-            event_count = len(events_by_measure[measure][event])
-            beat_division = (1920 / scale.denominator) * scale.numerator
-
-            new_chips = []
-            for i in range(len(events_by_measure[measure][event])):
-                c = events_by_measure[measure][event][i]
-
-                new_chips.append(c)
-                new_chips += ['00'] * (int(beat_division / len(events_by_measure[measure][event])) - 1)
-
-            events_by_measure[measure][event] = new_chips
-
-    return events_by_measure
-
-
-def get_bpms_at_measure_beat(events, bpms):
-    bpms_at_measure_beat = {}
-
-    for measure in events:
-        if 0x08 in events[measure]:
-            for i in range(len(events[measure][0x08])):
-                if events[measure][0x08][i] != "00":
-                    if measure not in bpms_at_measure_beat:
-                        bpms_at_measure_beat[measure] = {}
-
-                    if i not in bpms_at_measure_beat[measure]:
-                        bpms_at_measure_beat[measure][i] = {}
-
-                    val = int(events[measure][0x08][i], 36)
-                    bpms_at_measure_beat[measure][i] = bpms[val]
-
-    if 0 not in bpms_at_measure_beat:
-        bpms_at_measure_beat[0] = {0: bpms[0]}
-
-    return bpms_at_measure_beat
-
-
-def get_guitar_long_notes_at_measure_beat(events):
-    guitar_long_notes_at_measure_beat = {}
-
-    for measure in events:
-        for long_event in [0x2a, 0x2c]:
-            if long_event in events[measure]:
-                for i in range(len(events[measure][long_event])):
-                    if events[measure][long_event][i] != "00":
-                        if measure not in guitar_long_notes_at_measure_beat:
-                            guitar_long_notes_at_measure_beat[measure] = {}
-
-                        guitar_long_notes_at_measure_beat[measure][i] = True
-
-    return guitar_long_notes_at_measure_beat
-
-
-def get_bass_long_notes_at_measure_beat(events):
-    bass_long_notes_at_measure_beat = {}
-
-    for measure in events:
-        for long_event in [0x2b, 0x2d]:
-            if long_event in events[measure]:
-                for i in range(len(events[measure][long_event])):
-                    if events[measure][long_event][i] != "00":
-                        if measure not in bass_long_notes_at_measure_beat:
-                            bass_long_notes_at_measure_beat[measure] = {}
-
-                        bass_long_notes_at_measure_beat[measure][i] = True
-
-    return bass_long_notes_at_measure_beat
-
-
-def get_notes_by_measure_beat(events):
-    notes_by_measure_beat = {}
-
-    for measure in events:
-        for event in events[measure]:
-            if event in guitar_range or event in bass_range:
-                for i in range(len(events[measure][event])):
-                    if events[measure][event][i] != "00":
-                        if measure not in notes_by_measure_beat:
-                            notes_by_measure_beat[measure] = {}
-
-                        if event in guitar_range:
-                            notes_by_measure_beat[measure][i] = 1
-                        elif event in bass_range:
-                            notes_by_measure_beat[measure][i] = 2
-                        else:
-                            notes_by_measure_beat[measure][i] = 0
-
-    return notes_by_measure_beat
-
-
-def get_long_note_time_by_measure_beat(events_by_measure, long_notes_at_measure_beat, part):
-    long_note_time_by_measure_beat = {}
-
-    notes_by_measure_beat = get_notes_by_measure_beat(events_by_measure)
-
-    for measure in long_notes_at_measure_beat:
-        for beat in long_notes_at_measure_beat[measure]:
-            if measure in notes_by_measure_beat:
-                note_beats = [
-                    note_beat
-                    for note_beat in notes_by_measure_beat[measure]
-                    if note_beat <= beat
-                ]
-                last_note = (measure, sorted(note_beats)[-1])
-            else:
-                m = measure
-                while m > 0 and m not in notes_by_measure_beat:
-                    m -= 1
-
-                note_beats = [note_beat for note_beat in notes_by_measure_beat[m]]
-                last_note = (m, sorted(note_beats)[-1])
-
-            if last_note[0] not in long_note_time_by_measure_beat:
-                long_note_time_by_measure_beat[last_note[0]] = {}
-
-            if notes_by_measure_beat[last_note[0]][last_note[1]] == part:
-                long_note_time_by_measure_beat[last_note[0]][last_note[1]] = (measure, beat)
-
-    return long_note_time_by_measure_beat
-
-
-def generate_sound_metadata_map(sound_metadata, wav_filenames, wav_volumes, wav_pans, target_id=30, override_target_id=100, is_drums=False):
-    sound_metadata_map = {}
-
-    for wav_id in wav_filenames:
-        filename = wav_filenames[wav_id]
-
-        sound_id = target_id
-        if is_drums and filename.startswith("_override_clipped"):
-            sound_id = override_target_id
-
-        while sound_id in sound_metadata['data']:
-            sound_id += 1
-
-        if is_drums and filename.startswith("_override_clipped"):
-            override_target_id = sound_id
-        else:
-            target_id = sound_id
-
-        if target_id >= 100 and is_drums:
-            print("Ran into override sound IDs, too many drum samples so this will probably sound weird when played in-game", sound_id, filename)
-
-        md = {
-            "sound_id": sound_id,
-            "filename": filename,
-            "volume": 127,  # Max
-            "pan": 64,  # Center
-            'flags': [],
-        }
-
-        # Volume is broken for drum archives? Too many files causes things to crash
-        if wav_id in wav_volumes:
-            md['volume'] = int(round(127 * (wav_volumes[wav_id] / 100)))
-
-        if wav_id in wav_pans:
-            md['pan'] = int(round(((int(wav_pans[wav_id]) * (128/2)) / 100) + (128/2)))
-
-        map_id = sound_id
-        found_match = False
-        for k in sound_metadata['data']:
-            item = sound_metadata['data'][k]
-
-            # TODO: Add following to if statement if mixing volume in VA3 file
-            # and item['volume'] == md['volume']:
-            if item['filename'] == md['filename'] and item['pan'] == md['pan']:
-                map_id = item['sound_id']
-                found_match = True
-                break
-
-        sound_metadata_map[wav_id] = map_id
-
-        if not found_match:
-            sound_metadata['data'][map_id] = md
-
-    return sound_metadata_map, sound_metadata
-
-
-bpm_cache = {}
-def find_last_bpm(measure, target_beat, bpms_at_measure_beat):
-    global bpm_cache
-
-    last_bpm = 0
-
-    if measure in bpm_cache and target_beat in bpm_cache[measure]:
-        return bpm_cache[measure][target_beat]
-
-    for pk in sorted(bpms_at_measure_beat.keys()):
-        if pk > measure:
-            break
-
-        if pk not in bpms_at_measure_beat:
-            continue
-
-        for subbeat_k in sorted(bpms_at_measure_beat[pk].keys()):
-            is_start = measure == 0 and target_beat == 0
-            if not is_start and pk == measure and subbeat_k > target_beat:
-                break
-
-            last_bpm = bpms_at_measure_beat[pk][subbeat_k]
-
-    if measure not in bpm_cache:
-        bpm_cache[measure] = {}
-
-    bpm_cache[measure][target_beat] = last_bpm
-
-    return last_bpm
-
-def is_mid_bpm(measure, bpms_at_measure_beat):
-    if measure not in bpms_at_measure_beat:
-        return False
-
-    if len(bpms_at_measure_beat[measure].keys()) > 1:
-        return True
-
-    for subbeat_k in sorted(bpms_at_measure_beat[measure].keys()):
-        if subbeat_k > 0:
-            return True
-
-    return False
-
-
-timestamp_cache = {}
-timestamp_cache2 = {}
-def calculate_current_timestamp(measure, target_beat, measure_lengths, bpms_at_measure_beat):
-    global bpm_cache
-    global timestamp_cache
-    global timestamp_cache2
-
-    def _calculate_current_timestamp(measure, target_beat, prev, timesig, bpm):
-        cache_key = "%d_%d_%d_%d_%f" % (
-            measure,
-            target_beat,
-            timesig.numerator,
-            timesig.denominator,
-            bpm
-        )
-
-        if cache_key in timestamp_cache2:
-            return timestamp_cache2[cache_key]
-
-        one_measure = (1920 / timesig.denominator) * timesig.numerator
-        beat_ts = (60 / (bpm * (timesig.denominator / 4))) * 300
-        beat_len = (beat_ts * timesig.numerator) / one_measure
-
-        timestamp = (((measure * one_measure) + target_beat) * beat_len) / 300
-        timestamp_cache2[cache_key] = timestamp
-
-        return timestamp
-
-    if measure in timestamp_cache and target_beat in timestamp_cache[measure]:
-        return timestamp_cache[measure][target_beat]
-
-    measure_lengths_before_target = {}
-    results = [0]
-    keys = sorted(measure_lengths.keys())
-
-    if len(keys) > 0:
-        measure_lengths_before_target[keys[0]] = 0
-
-    for cur_measure in range(measure + 1):
-        current_timesig = find_last_timesig(cur_measure, measure_lengths)
-
-        if cur_measure == measure or is_mid_bpm(cur_measure, bpms_at_measure_beat):
-            numerator = current_timesig.numerator
-            denominator = current_timesig.denominator
-            beat_division = int(round((1920 // denominator) * numerator))
-
-            for cur_beat in range(beat_division):
-                if cur_measure not in bpm_cache or cur_beat not in bpm_cache[cur_measure]:
-                    current_bpm = find_last_bpm(cur_measure, cur_beat, bpms_at_measure_beat)
-                else:
-                    current_bpm = bpm_cache[cur_measure][cur_beat]
-
-                if cur_measure >= measure and cur_beat >= target_beat:
-                    break
-
-                cache_key = "0_1_%d_%d_%f" % (
-                    current_timesig.numerator,
-                    current_timesig.denominator,
-                    current_bpm
-                )
-
-                results.append(results[-1] + timestamp_cache2.get(cache_key, _calculate_current_timestamp(0, 1, results[-1], current_timesig, current_bpm)))
-        else:
-            cur_beat = 0
-
-            if cur_measure not in bpm_cache or cur_beat not in bpm_cache[cur_measure]:
-                current_bpm = find_last_bpm(cur_measure, cur_beat, bpms_at_measure_beat)
-            else:
-                current_bpm = bpm_cache[cur_measure][cur_beat]
-
-            cache_key = "1_0_%d_%d_%f" % (
-                current_timesig.numerator,
-                current_timesig.denominator,
-                current_bpm
-            )
-
-            if cache_key in timestamp_cache2:
-                results.append(results[-1] + timestamp_cache2[cache_key])
-            else:
-                results.append(results[-1] + _calculate_current_timestamp(1, 0, results[-1], current_timesig, current_bpm))
-
-    if measure not in timestamp_cache:
-        timestamp_cache[measure] = {}
-
-    result = int(round(results[-1] * 300))
-    timestamp_cache[measure][target_beat] = result
-
-    return result
-
-
-def find_last_timesig(measure, measure_lengths):
-    last_timesig = None
-
-    for pk in sorted(measure_lengths.keys()):
-        if pk > measure:
-            break
-
-        if pk not in measure_lengths:
-            continue
-
-        last_timesig = measure_lengths[pk]
-
-    return last_timesig
-
-
-def calculate_current_beat(measure, target_beat, measure_lengths):
-    def _calculate_current_beat(measure, target_beat, prev, timesig):
-        numerator = timesig.numerator
-        denominator = timesig.denominator
-        timesig = numerator / (timesig.denominator_orig / 2)
-        beat_division = (1920 / denominator) * timesig
-        return prev + measure * beat_division + target_beat
-
-    measure_lengths_before_target = {}
-    keys = sorted(measure_lengths.keys())
-
-    if len(keys) > 0:
-        measure_lengths_before_target[keys[0]] = 0
-
-    last_key = 0
-    for i in range(1, len(keys)):
-        if keys[i] <= int(measure):
-            pk = keys[i-1]
-
-            measure_lengths_before_target[keys[i]] = _calculate_current_beat(
-                keys[i] - pk,
-                0,
-                measure_lengths_before_target[keys[i-1]],
-                measure_lengths[keys[i-1]]
-            )
-            last_key = keys[i]
-        else:
-            break
-
-    return _calculate_current_beat(
-        measure - last_key,
-        0,
-        measure_lengths_before_target[last_key],
-        measure_lengths[last_key]
-    )
-
-
-def add_hold_notes(chart_data, long_note_time_by_measure_beat, long_note_info):
-    for measure in long_note_time_by_measure_beat:
-        for beat in long_note_time_by_measure_beat[measure]:
-            if len(long_note_time_by_measure_beat[measure][beat]) != 2:
-                print("Couldn't match long note")
-                print(long_note_time_by_measure_beat[measure][beat])
-                exit(1)
-
-            m2, b2 = long_note_time_by_measure_beat[measure][beat][0]
-
-            if m2 in long_note_info and b2 in long_note_info[m2]:
-                end_time = long_note_info[m2][b2]
-            else:
-                print("Couldn't find long note end time")
-                exit(1)
-
-            for data in chart_data['beats'][long_note_time_by_measure_beat[measure][beat][1]]:
-                if data['name'] == "note" and data['data']['note'] != "auto" and data['data']['auto_note'] == 0:
-                    data['data']['guitar_special'] |= 0x02  # Hold note
-                    data['data']['hold_duration'] = end_time - data['timestamp']
-
-    return chart_data
-
-
-def generate_timestamp_set(chart, last_event):
-    chart['timestamp'] = {}
-
-    for x in sorted(chart['beats'].keys()):
-        # Remove anything past the end point
-        if x > last_event[2]:
-            print("skipped", x, chart['beats'][x], last_event)
-            continue
-
-        for x2 in chart['beats'][x]:
-            if x2['timestamp'] not in chart['timestamp']:
-                chart['timestamp'][x2['timestamp']] = []
-
-            x2['beat'] = int(x)
-
-            chart['timestamp'][x2['timestamp']].append(x2)
-
-    return chart
-
-
-def get_valid_chart(chart):
-    # A chart must have at least 1 note (played) to be considered valid
-    if not chart or 'timestamp' not in chart:
-        return None
-
-    if len(chart['timestamp']) == 0:
-        return None
-
-    for timestamp in chart['timestamp']:
-        for x in chart['timestamp'][timestamp]:
-            if x['name'] == "note" and x['data']['note'] != "auto":
-                return chart
-
-    return None
-
-
-def get_chart_datas(chart_data, lines):
-    song_title = get_value_from_dtx("TITLE", lines, default="")
-    artist_name = get_value_from_dtx("ARTIST", lines, default="")
-    drum_difficulty = get_value_from_dtx("DLEVEL", lines, default=0)
-    guitar_difficulty = get_value_from_dtx("GLEVEL", lines, default=0)
-    bass_difficulty = get_value_from_dtx("BLEVEL", lines, default=0)
-    pre_image = get_value_from_dtx("PREIMAGE", lines)
-    bpms, base_bpm = get_bpms_from_dtx(lines)
-    first_bpm = bpms[sorted(bpms.keys(), key=lambda x:int(x))[0]]
-
-    drum_chart_data = {
-        "artist": artist_name,
-        "title": song_title,
-        "bpm": first_bpm,
-        "level": drum_difficulty,
-        "preimage": pre_image,
-        "timestamp": {},
-        "header": {
-            "beat_division": 1920 // 4,
-            "time_division": 300,
-            "unk_sys": 0,
-            "is_metadata": 0,
-            "difficulty": 0,
-            "game_type": 0,
-        }
-    }
-
-    guitar_chart_data = {
-        "artist": artist_name,
-        "title": song_title,
-        "bpm": first_bpm,
-        "level": guitar_difficulty,
-        "preimage": pre_image,
-        "timestamp": {},
-        "header": {
-            "beat_division": 1920 // 4,
-            "time_division": 300,
-            "unk_sys": 0,
-            "is_metadata": 0,
-            "difficulty": 0,
-            "game_type": 1,
-        }
-    }
-
-    bass_chart_data = {
-        "artist": artist_name,
-        "title": song_title,
-        "bpm": first_bpm,
-        "level": bass_difficulty,
-        "preimage": pre_image,
-        "timestamp": {},
-        "header": {
-            "beat_division": 1920 // 4,
-            "time_division": 300,
-            "unk_sys": 0,
-            "is_metadata": 0,
-            "difficulty": 0,
-            "game_type": 2,
-        }
-    }
-
-    # Split chart_data based on type
-    for k in chart_data['timestamp']:
-        drum_chart_data['timestamp'][k] = []
-        guitar_chart_data['timestamp'][k] = []
-        bass_chart_data['timestamp'][k] = []
-
-        for entry in chart_data['timestamp'][k]:
-            if entry['name'] != 'note':
-                drum_chart_data['timestamp'][k].append(entry)
-                guitar_chart_data['timestamp'][k].append(entry)
-                bass_chart_data['timestamp'][k].append(entry)
-            else:
-                if entry['data']['note'] == "auto":
-                    drum_chart_data['timestamp'][k].append(entry)
-                    guitar_chart_data['timestamp'][k].append(entry)
-                    bass_chart_data['timestamp'][k].append(entry)
-                elif entry['data']['note'] in drum_mapping:
-                    drum_chart_data['timestamp'][k].append(entry)
-                elif entry['data']['note'] in guitar_mapping:
-                    guitar_chart_data['timestamp'][k].append(entry)
-                elif entry['data']['note'] in bass_mapping:
-                    bass_chart_data['timestamp'][k].append(entry)
-                else:
-                    print("Unknown note, don't know what chart it belongs to")
-                    print(entry)
-                    exit(1)
-
-    return get_valid_chart(drum_chart_data), get_valid_chart(guitar_chart_data), get_valid_chart(bass_chart_data)
-
-
-# TODO: Try to refactor this more later
-def parse_dtx_to_intermediate(filename,
-                              params,
-                              sound_metadata,
-                              target_parts=['drum', 'guitar', 'bass', 'open']):
-    global timestamp_cache
-    global bpm_cache
-    global timestamp_cache2
-
-    start_offset_padding = params.get('dtx_pad_start', 0)
-
-    timestamp_cache = {}
-    bpm_cache = {}
-    timestamp_cache2 = {}
-    bpms_at_measure_beat = {}
-
-    if not filename or not os.path.exists(filename):
-        return None, None, None, None, sound_metadata
-
-    try:
-        with open(filename, "r", encoding="shift-jis") as f:
-            lines = [x.strip() for x in f if x.strip().startswith("#")]
-    except:
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                lines = [x.strip() for x in f if x.strip().startswith("#")]
-        except:
-            with open(filename, "r", encoding="utf-16") as f:
-                lines = [x.strip() for x in f if x.strip().startswith("#")]
-
-    # Parse all commands
-    bgm_info = []
-    default_notes = {}
-
-    preview_filename = get_value_from_dtx("PREVIEW", lines)
-    wav_filenames, wav_lengths = get_wavs_from_dtx(lines, target_parts, sound_metadata, not params.get('no_sounds', False))
-    wav_volumes = get_wav_volumes_from_dtx(lines)
-    wav_pans = get_wav_pans_from_dtx(lines)
-    bpms, base_bpm = get_bpms_from_dtx(lines)
-
-    bonus_notes = get_bonus_notes_from_dtx(lines, start_offset_padding)
-    measure_lengths = get_measure_lengths_from_dtx(lines, start_offset_padding)
-    events_by_measure = get_events_by_measure_from_dtx(lines, start_offset_padding)
-
-    # Build data for sound metadata file
-    # This must be correct to get the right sound id for the note commands
-    # It's not possible to store panning information in the chart data,
-    # but volume data is possible.
-    # As a result, all volume flags will be stored in the chart data
-    # but the panning will be in the sound metadata.
-    sound_metadata_map, sound_metadata = generate_sound_metadata_map(sound_metadata, wav_filenames, wav_volumes, wav_pans, is_drums='drum' in target_parts)
-    sound_metadata_guitar = []
-    sound_metadata_drum = []
-
-    events_by_measure = pad_events(events_by_measure, measure_lengths)
-    bpms_at_measure_beat = get_bpms_at_measure_beat(events_by_measure, bpms)
-
-    guitar_long_notes_at_measure_beat = get_guitar_long_notes_at_measure_beat(events_by_measure)
-    guitar_long_note_time_by_measure_beat = \
-        get_long_note_time_by_measure_beat(events_by_measure, guitar_long_notes_at_measure_beat, 1)
-
-    bass_long_notes_at_measure_beat = get_bass_long_notes_at_measure_beat(events_by_measure)
-    bass_long_note_time_by_measure_beat = \
-        get_long_note_time_by_measure_beat(events_by_measure, bass_long_notes_at_measure_beat, 2)
-
-    metadata_chart_data = {
-        "beats": {},
-        "header": {
-            "beat_division": 1920 // 4,
-            "time_division": 300,
-            "unk_sys": 0,
-            "is_metadata": 1,
-            "difficulty": 1,
-            "game_type": 0,
-        }
-    }
-
-    chart_data = {
-        "beats": {},
-        "header": {
-            "beat_division": 1920 // 4,
-            "time_division": 300,
-            "unk_sys": 0,
-            "is_metadata": 0,
-            "difficulty": 0,
-            "game_type": 0,
-        }
-    }
-
-    # Add start events
-    timestamp_cur = calculate_current_timestamp(0, 0, measure_lengths, bpms_at_measure_beat)
-    chart_data['beats'][0] = []
-    chart_data['beats'][0].append({
-        "name": "startpos",
-        'timestamp': timestamp_cur,
-    })
-    chart_data['beats'][0].append({
-        "name": "chipstart",
-        "data": {
-            "unk": 0
-        },
-        'timestamp': timestamp_cur,
-    })
-
-    metadata_chart_data['beats'][0] = []
-    metadata_chart_data['beats'][0].append({
-        "name": "startpos",
-        'timestamp': timestamp_cur,
-    })
-
-    metadata_chart_data['beats'][0].append({
-        "name": "baron",
-        'timestamp': timestamp_cur,
-    })
-
-    last_seen_bpm = bpms[sorted(bpms.keys(), key=lambda x:int(x))[0]]
-    metadata_chart_data['beats'][0].append({
-        "data": {
-            "bpm": last_seen_bpm
-        },
-        "name": "bpm",
-        'timestamp': timestamp_cur,
-    })
-
-    guitar_long_note_info = {}
-    bass_long_note_info = {}
-    last_event = (0, 0, 0)
-    current_time_signature = Fraction(4, 4)
-    keys = list(events_by_measure.keys()) + list(measure_lengths.keys())
-    measure_list = sorted(list(set(keys)), key=lambda x: int(x))
-    for measure in range(measure_list[-1] + 1):
-        time_signature = find_last_timesig(measure, measure_lengths)
-        same_numerator = time_signature.numerator == current_time_signature.numerator
-        same_denominator = time_signature.denominator == current_time_signature.denominator
-        updated_time_signature = not same_numerator or not same_denominator
-        current_time_signature = time_signature
-
-        global_beat_metadata = calculate_current_beat(
-            measure,
-            0,
-            measure_lengths
-        )
-
-        global_beat_chart = calculate_current_beat(
-            measure,
-            0,
-            measure_lengths
-        )
-
-        if global_beat_metadata not in metadata_chart_data['beats']:
-            metadata_chart_data['beats'][global_beat_metadata] = []
-
-        timestamp_cur = calculate_current_timestamp(measure, 0, measure_lengths, bpms_at_measure_beat)
-        if updated_time_signature:
-            metadata_chart_data['beats'][global_beat_metadata].append({
-                "data": {
-                    "numerator": time_signature.numerator,
-                    "denominator": time_signature.denominator,
-                },
-                "name": "barinfo",
-                'timestamp': timestamp_cur,
-            })
-
-        metadata_chart_data['beats'][global_beat_metadata].append({
-            "name": "measure",
-            "timestamp": timestamp_cur,
-        })
-
-        # x/16 time signature (and above?) only write half of the beat lines.
-        # This can be seen in Lindwurm. I haven't found any other instances
-        # of x/16 time signature to be able to check further.
-        beat_lines = current_time_signature.numerator
-        beat_lines_div = current_time_signature.denominator
-
-        if current_time_signature.denominator >= 16:
-            beat_lines /= 2
-            beat_lines_div /= 2
-
-        for j in range(1, int(round(beat_lines))):
-            cb = int(round(j * (1920 / beat_lines_div)))
-            beat = global_beat_metadata + cb
-
-            if beat not in metadata_chart_data['beats']:
-                metadata_chart_data['beats'][beat] = []
-
-            metadata_chart_data['beats'][beat].append({
-                "name": "beat",
-                "timestamp": calculate_current_timestamp(measure, cb, measure_lengths, bpms_at_measure_beat),
-            })
-
-        global_beat_metadata = int(round(global_beat_metadata))
-        global_beat_chart = int(round(global_beat_chart))
-
-        beat = global_beat_metadata
-
-        if measure in events_by_measure:
-            for event in events_by_measure[measure]:
-                auto_events = auto_play_ranges
-                ignore_events = [
-                    0x04,
-                    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2f,
-                    0x4c, 0x4d, 0x4e, 0x4f,
-                    0x51, 0x54,
-                    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa8, 0xaf,
-                    0xc2
-                ]
-
-                if event == 0x01:
-                    # BGM item
-                    data = events_by_measure[measure][event]
-                    for i in range(len(data)):
-                        if data[i] == '00':
-                            continue
-
-                        timestamp = calculate_current_timestamp(
-                            measure,
-                            i % len(data),
-                            measure_lengths,
-                            bpms_at_measure_beat
-                        )
-
-                        if int(data[i], 36) in wav_filenames:
-                            bgm_info.append({
-                                'filename': wav_filenames[int(data[i], 36)],
-                                'timestamp': timestamp / 300
-                            })
-
-                elif event == 0x03:
-                    # Base BPM addition
-                    data = events_by_measure[measure][event]
-                    for i in range(len(data)):
-                        if data[i] == '00':
-                            continue
-
-                        beat = global_beat_metadata + i
-
-                        if beat not in metadata_chart_data['beats']:
-                            metadata_chart_data['beats'][beat] = []
-
-                        new_bpm = int(data[i], 16) + base_bpm
-
-                        metadata_chart_data['beats'][beat].append({
-                            "data": {
-                                "bpm": new_bpm
-                            },
-                            "name": "bpm",
-                            "timestamp": calculate_current_timestamp(
-                                measure,
-                                i % len(data),
-                                measure_lengths,
-                                bpms_at_measure_beat
-                            ),
-                        })
-
-                        if beat > last_event[2]:
-                            last_event = (measure, i, beat)
-
-                        last_seen_bpm = new_bpm
-
-                elif event == 0x08:
-                    # BPM event
-                    data = events_by_measure[measure][event]
-                    for i in range(len(data)):
-                        if data[i] == '00':
-                            continue
-
-                        beat = global_beat_metadata + i
-
-                        if beat not in metadata_chart_data['beats']:
-                            metadata_chart_data['beats'][beat] = []
-
-                        if last_seen_bpm == bpms[int(data[i], 36)]:
-                            # Already the current BPM, don't write it again
-                            continue
-
-                        if not (measure == 0 and beat == 0):
-                            metadata_chart_data['beats'][beat].append({
-                                "data": {
-                                    "bpm": base_bpm + bpms[int(data[i], 36)]
-                                },
-                                "name": "bpm",
-                                "timestamp": calculate_current_timestamp(
-                                    measure,
-                                    i % len(data),
-                                    measure_lengths,
-                                    bpms_at_measure_beat
-                                ),
-                            })
-
-                            if beat > last_event[2]:
-                                last_event = (measure, i, beat)
-
-                            last_seen_bpm = base_bpm + bpms[int(data[i], 36)]
-
-                elif event == 0xc2:
-                    # baron/off
-                    data = events_by_measure[measure][event]
-                    for i in range(len(data)):
-                        if data[i] == '00':
-                            continue
-
-                        beat = global_beat_metadata + i
-
-                        name = ""
-                        if data[i] == '01':
-                            name = "baron"
-                        elif data[i] == '02':
-                            name = "baroff"
-                        else:
-                            # Not a valid event, but we're using it anyway.
-                            # This is being abused for the endpos event
-                            # to properly calculate the exact end of a song.
-                            last_event = (measure, i, beat)
-                            continue
-
-                        if beat not in metadata_chart_data['beats']:
-                            metadata_chart_data['beats'][beat] = []
-
-                        metadata_chart_data['beats'][beat].append({
-                            "name": name,
-                            "timestamp": calculate_current_timestamp(
-                                measure,
-                                i % len(data),
-                                measure_lengths,
-                                bpms_at_measure_beat
-                            ),
-                        })
-
-                        if beat > last_event[2]:
-                            last_event = (measure, i, beat)
-
-                elif event in default_note_events:
-                    data = events_by_measure[measure][event]
-                    for i in range(len(data)):
-                        if data[i] == '00':
-                            continue
-
-                        sound_id = int(data[i], 36)
-                        mapped_sound_id = sound_metadata_map.get(sound_id, 0)
-                        default_notes[reverse_dtx_mapping[event]] = mapped_sound_id
-
-                elif event in [0x2a, 0x2c]:
-                    # Guitar long note
-                    data = events_by_measure[measure][event]
-                    for i in range(len(data)):
-                        if data[i] == '00':
-                            continue
-
-                        if measure not in guitar_long_note_info:
-                            guitar_long_note_info[measure] = {}
-
-                        guitar_long_note_info[measure][i] = calculate_current_timestamp(
-                            measure,
-                            i % len(data),
-                            measure_lengths,
-                            bpms_at_measure_beat
-                        )
-
-                elif event in [0x2b, 0x2d]:
-                    # Bass long note
-                    data = events_by_measure[measure][event]
-                    for i in range(len(data)):
-                        if data[i] == '00':
-                            continue
-
-                        if measure not in bass_long_note_info:
-                            bass_long_note_info[measure] = {}
-
-                        bass_long_note_info[measure][i] = calculate_current_timestamp(
-                            measure,
-                            i % len(data),
-                            measure_lengths,
-                            bpms_at_measure_beat
-                        )
-
-                elif event in reverse_dtx_mapping:
-                    data = events_by_measure[measure][event]
-                    for i in range(len(data)):
-                        if data[i] == '00':
-                            continue
-
-                        beat = global_beat_chart + i
-
-                        if beat not in chart_data['beats']:
-                            chart_data['beats'][beat] = []
-
-                        sound_id = int(data[i], 36)
-                        mapped_sound_id = sound_metadata_map.get(sound_id, 0)
-
-                        if event in drum_range:
-                            sound_metadata_drum.append(mapped_sound_id)
-
-                            if reverse_dtx_mapping[event] not in default_notes:
-                                default_notes[reverse_dtx_mapping[event]] = mapped_sound_id
-
-                        elif event in guitar_range or event in bass_range:
-                            sound_metadata_guitar.append(mapped_sound_id)
-
-                        if beat > last_event[2]:
-                            last_event = (measure, i, beat)
-
-                        if event in drum_range and 'drum' not in target_parts:
-                            continue
-
-                        elif event in guitar_range and 'guitar' not in target_parts:
-                            continue
-
-                        elif event in bass_range and 'bass' not in target_parts:
-                            continue
-
-                        wail_direction = 1
-                        wail_flag = 0
-                        wail_event = -1
-
-                        if event in guitar_range:
-                            wail_event = 0x28
-                        elif event in bass_range:
-                            wail_event = 0xa8
-
-                        if wail_event != -1 and wail_event in events_by_measure[measure]:
-                            if len(events_by_measure[measure][wail_event]) == len(events_by_measure[measure][event]) and events_by_measure[measure][wail_event][i] != "00":
-                                wail_flag = 1
-
-                        if event in guitar_range and measure in guitar_long_note_time_by_measure_beat and i in guitar_long_note_time_by_measure_beat[measure]:
-                            guitar_long_note_time_by_measure_beat[measure][i] = (guitar_long_note_time_by_measure_beat[measure][i], beat)
-                        elif event in bass_range and measure in bass_long_note_time_by_measure_beat and i in bass_long_note_time_by_measure_beat[measure]:
-                            bass_long_note_time_by_measure_beat[measure][i] = (bass_long_note_time_by_measure_beat[measure][i], beat)
-
-                        chart_data['beats'][beat].append({
-                            "data": {
-                                "auto_note": 0,
-                                "auto_volume": 0,
-                                "hold_duration": 0,
-                                "note": reverse_dtx_mapping[event],
-                                "note_length": 0,
-                                "sound_id": mapped_sound_id,
-                                "unk": 0,
-                                "volume": 127 if sound_id not in wav_volumes else int(round(127 * (wav_volumes[sound_id] / 100))),
-                                "wail_misc": wail_direction if wail_flag else 0,
-                                "guitar_special": wail_flag,
-                                "bonus_note": 1 if measure in bonus_notes and i in bonus_notes[measure] and sound_id in bonus_notes[measure][i] else 0,
-                            },
-                            "name": "note",
-                            "timestamp": calculate_current_timestamp(measure, i % len(data), measure_lengths, bpms_at_measure_beat),
-                        })
-
-                        if 'guitar' in target_parts or 'bass' in target_parts or 'open' in target_parts:
-                            if sound_id in wav_lengths:
-                                chart_data['beats'][beat][-1]['data']['note_length'] = wav_lengths[sound_id]
-
-                elif event in auto_events:
-                    if 'guitar' in target_parts or 'bass' in target_parts or 'open' in target_parts:
-                        continue
-
-                    data = events_by_measure[measure][event]
-
-                    for i in range(len(data)):
-                        if data[i] == '00':
-                            continue
-
-                        beat = global_beat_chart + i
-
-                        if beat not in chart_data['beats']:
-                            chart_data['beats'][beat] = []
-
-                        # Auto note
-                        sound_id = int(data[i], 36)
-
-                        chart_data['beats'][beat].append({
-                            "data": {
-                                "auto_note": 1,
-                                "auto_volume": 1,
-                                "hold_duration": 0,
-                                "note": "auto",
-                                "note_length": 0,
-                                "sound_id": 0 if sound_id not in sound_metadata_map else sound_metadata_map[sound_id],
-                                "unk": 0,
-                                "volume": 127 if sound_id not in wav_volumes else int(round(127 * (wav_volumes[sound_id] / 100))),
-                                "wail_direction": 0,
-                                "bonus_note": 0,
-                                "guitar_special": 0,
-                            },
-                            "name": "note",
-                            "timestamp": calculate_current_timestamp(measure, i % len(data), measure_lengths, bpms_at_measure_beat),
-                        })
-
-                        if 'guitar' in target_parts or 'bass' in target_parts or 'open' in target_parts:
-                            if sound_id in wav_lengths:
-                                chart_data['beats'][beat][-1]['data']['note_length'] = wav_lengths[sound_id]
-
-                        if beat > last_event[2]:
-                            last_event = (measure, i, beat)
-
-                elif event not in ignore_events:
-                    print("Unknown event %02x" % event)
-
-    chart_data = add_hold_notes(chart_data, guitar_long_note_time_by_measure_beat, guitar_long_note_info)
-    chart_data = add_hold_notes(chart_data, bass_long_note_time_by_measure_beat, bass_long_note_info)
-
-    # Add end events
-    if last_event[2] not in chart_data['beats']:
-        chart_data['beats'][last_event[2]] = []
-
-    if last_event[2] not in metadata_chart_data['beats']:
-        metadata_chart_data['beats'][last_event[2]] = []
-
-    chart_data['beats'][last_event[2]].append({
-        "name": "chipend",
-        "timestamp": calculate_current_timestamp(last_event[0], last_event[1], measure_lengths, bpms_at_measure_beat),
-    })
-
-    # Delayed end command
-    pad_end = params.get('dtx_pad_end', 0)
-
-    if pad_end > 0:
-        one_measure = (1920 / measure_lengths[0].denominator) * (measure_lengths[0].numerator / (measure_lengths[0].denominator_orig / 2))
-        last_event = (last_event[0] + 2, 0, last_event[2] + (one_measure *  pad_end))
-
-    if last_event[2] not in chart_data['beats']:
-        chart_data['beats'][last_event[2]] = []
-
-    if last_event[2] not in metadata_chart_data['beats']:
-        metadata_chart_data['beats'][last_event[2]] = []
-
-    chart_data['beats'][last_event[2]].append({
-        "name": "endpos",
-        "timestamp": calculate_current_timestamp(last_event[0], last_event[1], measure_lengths, bpms_at_measure_beat),
-    })
-
-    metadata_chart_data['beats'][last_event[2]].append({
-        "name": "endpos",
-        "timestamp": calculate_current_timestamp(last_event[0], last_event[1], measure_lengths, bpms_at_measure_beat),
-    })
-
-    chart_data = generate_timestamp_set(chart_data, last_event)
-    metadata_chart_data = generate_timestamp_set(metadata_chart_data, last_event)
-
-    # Remove any BGMs from the sound metadata
-    for bgm in bgm_info:
-        remove_keys = []
-        for k in sound_metadata['data']:
-            if sound_metadata['data'][k]['filename'] == bgm['filename']:
-                remove_keys.append(k)
-
-        for k in remove_keys:
-            del sound_metadata['data'][k]
-
-    sound_metadata['drum'] = list(set(sound_metadata['drum'] + sound_metadata_drum))
-    sound_metadata['guitar'] = list(set(sound_metadata['guitar'] + sound_metadata_guitar))
-    sound_metadata['bgm'] = {
-        'end': calculate_current_timestamp(last_event[0], last_event[1], measure_lengths, bpms_at_measure_beat) / 300,
-        'data': bgm_info
-    }
-    sound_metadata['preview'] = preview_filename
-    sound_metadata['defaults'] = default_notes
-
-    drum_chart_data, guitar_chart_data, bass_chart_data = get_chart_datas(chart_data, lines)
-
-    return metadata_chart_data, drum_chart_data, guitar_chart_data, bass_chart_data, sound_metadata
+def convert_base36(val, padding):
+    return base_repr(val, 36, padding=padding)[-padding:]
 
 
 def create_json_from_dtx(params):
+    def calculate_hold_duration(holds, measure_id, beat_id):
+        for hold in holds:
+            if hold[0][0] == measure_id and hold[0][1] == beat_id:
+                return hold
+
+        return None
+
+
+    def calculate_wail_flag(wails, measure_id, beat_id):
+        for wail in wails:
+            if wail[0] == measure_id and wail[1] == beat_id:
+                return 2 if wail[2] == 1 else 1
+
+        return None
+
+
+    def is_bonus_note(bonus_notes, measure_id, beat_id, match_note):
+        for bonus in bonus_notes:
+            if bonus[0] == measure_id and bonus[1] == beat_id and bonus[2] == match_note:
+                return 1
+
+        return 0
+
+
+    def get_sound_id(filename):
+        # TODO: Do this properly
+        if filename[:2] in ["g_", "d_"]:
+            filename = filename[2:]
+
+        return int(os.path.splitext(os.path.basename(filename))[0], 16)
+
+
+    def expand_measure(measure, division=192):
+        split = [int(measure[i:i+2], 36) for i in range(0, len(measure), 2)]
+
+        output = []
+        for i in range(len(split)):
+            output.append(split[i])
+            output += [0] * ((division // (len(measure) // 2)) - 1)
+
+        return output
+
+
+    def generate_timestamps(parsed_lines, cur_bpm, bpm_list, division=192):
+        timestamp_by_beat = {}
+        cur_timestamp_step = 0.0
+        cur_timestamp = 0.0
+        for i in range(0, sorted(parsed_lines.keys())[-1] + 1):
+            for j in range(0, division):
+                if i not in timestamp_by_beat:
+                    timestamp_by_beat[i] = {}
+
+                timestamp_by_beat[i][j] = {
+                    'timestamp': int(round(cur_timestamp * 300)),
+                    'timestamp_ms': cur_timestamp
+                }
+
+                cur_timestamp += cur_timestamp_step
+
+                if i in parsed_lines and 0x08 in parsed_lines[i] and parsed_lines[i][0x08][j] != 0:
+                    cur_bpm = bpm_list[parsed_lines[i][0x08][j]]
+                    cur_timestamp_step = (4 * (60 / cur_bpm)) / division
+
+        return timestamp_by_beat
+
+
+    def parse_dtx_to_intermediate(filename, params, sound_metadata, part, division=192):
+        def get_sound_length(input_json, sound_id):
+            if input_json and 'sound_lengths' in input_json and sound_id in input_json['sound_lengths']:
+                return input_json['sound_lengths'][sound_id]
+
+            return 0
+
+        json_events = []
+
+        if not filename or not os.path.exists(filename):
+            return None, None, None, None, sound_metadata
+
+        try:
+            with open(filename, "r", encoding="shift-jis") as f:
+                lines = [x.strip() for x in f if x.strip().startswith("#")]
+        except:
+            try:
+                with open(filename, "r", encoding="utf-8") as f:
+                    lines = [x.strip() for x in f if x.strip().startswith("#")]
+            except:
+                with open(filename, "r", encoding="utf-16") as f:
+                    lines = [x.strip() for x in f if x.strip().startswith("#")]
+
+        parsed_lines = {}
+        bpm_list = {}
+        wav_list = {}
+        volume_list = {}
+        cur_bpm = None
+        comment_json = None
+        guitar_holds_list = []
+        bass_holds_list = []
+        guitar_wail_list = []
+        bass_wail_list = []
+        bonus_notes = []
+
+        for line in lines:
+            event_str = line[1:]
+            event_str = event_str[:min(event_str.index(':' if ':' in event_str else ' '), event_str.index(' '))]
+            event_data = line[1 + len(event_str) + 1:].strip()
+
+            if event_str == "TITLE":
+                pass
+
+            elif event_str == "ARTIST":
+                pass
+
+            elif event_str == "DLEVEL":
+                pass
+
+            elif event_str == "GLEVEL":
+                pass
+
+            elif event_str == "BLEVEL":
+                pass
+
+            elif event_str == "PREVIEW":
+                pass
+
+            elif event_str == "COMMENT":
+                comment_json = json.loads(event_data)
+
+            elif event_str.startswith("BPM"):
+                if event_str == "BPM":
+                    cur_bpm = float(event_data)
+                    continue
+
+                bpm_id = int(event_str[3:], 36)
+                bpm_list[bpm_id] = float(event_data)
+
+                if bpm_list[bpm_id] < 1:
+                    bpm_list[bpm_id] = 1
+
+                elif bpm_list[bpm_id] > 60000000:
+                    bpm_list[bpm_id] = 60000000
+
+            elif event_str.startswith("WAV"):
+                wav_id = int(event_str[3:], 36)
+                wav_list[wav_id] = event_data
+
+            elif event_str.startswith("VOLUME"):
+                wav_id = int(event_str[6:], 36)
+                volume_list[wav_id] = int(event_data)
+
+            else:
+                measure_id = int(line[1:4])
+                event_id = int(line[4:6], 16)
+
+                # TODO: Add support for time signature command, and automatically generate measure and beat lines based on that when
+
+                measure = expand_measure(event_data, division)
+
+                if measure_id not in parsed_lines:
+                    parsed_lines[measure_id] = {}
+
+                parsed_lines[measure_id][event_id] = measure
+
+                if event_id in reverse_dtx_mapping:
+                    # print(reverse_dtx_mapping[event_id])
+                    pass
+
+                elif event_id == 0x01:
+                    # BGM
+                    pass
+
+                elif event_id == 0xc2:
+                    # End position
+                    pass
+
+                elif event_id == 0x08:
+                    # BPM
+                    pass
+
+                elif event_id == 0x50:
+                    # Show measure bar
+                    pass
+
+                elif event_id == 0x51:
+                    # Show beat bar
+                    pass
+
+                elif event_id in [0x4c, 0x4d, 0x4e, 0x4f]:
+                    # Bonus notes
+                    for beat_id, val in enumerate(parsed_lines[measure_id][event_id]):
+                        if val != 0 and val in reverse_dtx_bonus_mapping:
+                            bonus_notes.append((measure_id, beat_id, reverse_dtx_bonus_mapping[val]))
+
+                elif event_id in auto_play_ranges:
+                    # Auto note
+                    pass
+
+                elif event_id == 0x28:
+                    # Guitar Wail
+                    for beat_id, val in enumerate(parsed_lines[measure_id][event_id]):
+                        if val != 0:
+                            guitar_wail_list.append((measure_id, beat_id, val))
+
+                elif event_id == 0xa8:
+                    # Bass Wail
+                    for beat_id, val in enumerate(parsed_lines[measure_id][event_id]):
+                        if val != 0:
+                            bass_wail_list.append((measure_id, beat_id, val))
+
+                elif event_id == 0x2c:
+                    # Guitar long note
+                    for beat_id, val in enumerate(parsed_lines[measure_id][event_id]):
+                        if val != 0:
+                            guitar_holds_list.append((measure_id, beat_id))
+
+
+                elif event_id == 0x2d:
+                    # Bass long note
+                    for beat_id, val in enumerate(parsed_lines[measure_id][event_id]):
+                        if val != 0:
+                            bass_holds_list.append((measure_id, beat_id))
+
+                else:
+                    print("Unknown event id %02x" % event_id)
+                    exit(1)
+
+        if len(guitar_holds_list) % 2:
+            print("Could not match all guitar long note starts with an end")
+            exit(1)
+
+        guitar_holds_list = [guitar_holds_list[i:i+2] for i in range(0, len(guitar_holds_list), 2)]
+
+        if len(bass_holds_list) % 2:
+            print("Could not match all bass long note starts with an end")
+            exit(1)
+
+        bass_holds_list = [bass_holds_list[i:i+2] for i in range(0, len(bass_holds_list), 2)]
+
+        timestamp_by_beat = generate_timestamps(parsed_lines, cur_bpm, bpm_list, division)
+
+        # Generate JSON using the timestamps generated
+        base_chart = []
+        drum_chart = []
+        guitar_chart = []
+        bass_chart = []
+
+        for measure_id in parsed_lines:
+            for event_id in parsed_lines[measure_id]:
+                for beat_id, val in enumerate(parsed_lines[measure_id][event_id]):
+                    timestamp = timestamp_by_beat[measure_id][beat_id]
+
+                    if val == 0:
+                        continue
+
+                    if event_id in reverse_dtx_mapping or event_id in auto_play_ranges:
+                        hold_timestamps = None
+                        wail_misc = None
+
+                        if event_id in drum_range:
+                            target_chart = drum_chart
+
+                        elif event_id in guitar_range:
+                            target_chart = guitar_chart
+                            hold_timestamps = calculate_hold_duration(guitar_holds_list, measure_id, beat_id)
+                            wail_misc = calculate_wail_flag(guitar_wail_list, measure_id, beat_id)
+
+                        elif event_id in bass_range:
+                            target_chart = bass_chart
+                            hold_timestamps = calculate_hold_duration(bass_holds_list, measure_id, beat_id)
+                            wail_misc = calculate_wail_flag(bass_wail_list, measure_id, beat_id)
+
+                        guitar_special = 0
+
+                        if hold_timestamps:
+                            guitar_special |= 2
+
+                        if wail_misc:
+                            guitar_special |= 1
+
+                        note_str = "auto" if event_id in auto_play_ranges else reverse_dtx_mapping[event_id]
+
+                        target_chart.append({
+                            'name': "note",
+                            'timestamp': timestamp['timestamp'],
+                            'timestamp_ms': timestamp['timestamp_ms'],
+                            'data': {
+                                'sound_id': get_sound_id(wav_list[val]),
+                                'note': note_str,
+                                'note_length': get_sound_length(comment_json, val),
+                                'hold_duration': timestamp_by_beat[hold_timestamps[1][0]][hold_timestamps[1][1]]['timestamp'] - timestamp_by_beat[hold_timestamps[0][0]][hold_timestamps[0][1]]['timestamp'] if hold_timestamps else 0,
+                                'volume': volume_list[val] if val in volume_list else 127,
+                                'wail_misc': wail_misc if wail_misc else 0,
+                                'guitar_special': guitar_special,
+                                'bonus_note': is_bonus_note(bonus_notes, measure_id, beat_id, note_str),
+                                'auto_note': 1 if event_id in auto_play_ranges else 0,
+                                'auto_volume': 1 if event_id in auto_play_ranges else 0,
+                                'unk': 0,
+                            }
+                        })
+
+                    elif event_id == 0x01:
+                        # BGM
+                        # Does this even really need to be handled?
+                        pass
+
+                    elif event_id == 0xc2:
+                        # Start/end position
+                        base_chart.append({
+                            'name': "endpos" if val == 1 else "startpos",
+                            'timestamp': timestamp['timestamp'],
+                            'timestamp_ms': timestamp['timestamp_ms'],
+                            'data': {}
+                        })
+
+                    elif event_id == 0x08:
+                        # BPM
+                        base_chart.append({
+                            'name': "bpm",
+                            'timestamp': timestamp['timestamp'],
+                            'timestamp_ms': timestamp['timestamp_ms'],
+                            'data': {
+                                'bpm': bpm_list[val],
+                            }
+                        })
+
+                    elif event_id == 0x50:
+                        # Show measure bar
+                        base_chart.append({
+                            'name': "measure",
+                            'timestamp': timestamp['timestamp'],
+                            'timestamp_ms': timestamp['timestamp_ms'],
+                            'data': {}
+                        })
+
+                    elif event_id == 0x51:
+                        # Show beat bar
+                        base_chart.append({
+                            'name': "beat",
+                            'timestamp': timestamp['timestamp'],
+                            'timestamp_ms': timestamp['timestamp_ms'],
+                            'data': {}
+                        })
+
+                    elif event_id in [0x28, 0xa8, 0x2c, 0x2d, 0x4c, 0x4d, 0x4e, 0x4f]:
+                        # Ignore these, they aren't errors and are intentionally not handled here
+                        pass
+
+                    else:
+                        print("Unknown event id %02x" % event_id)
+                        exit(1)
+
+
+        base_chart = {
+            'header': {
+                'difficulty': -1,
+                'is_metadata': 1,
+                'game_type': 0,
+            },
+            'beat_data': sorted(base_chart, key=lambda x:x['timestamp']),
+        }
+
+        drum_chart = {
+            'header': {
+                'difficulty': -1,
+                'is_metadata': 0,
+                'game_type': 0,
+            },
+            'beat_data': sorted(drum_chart, key=lambda x:x['timestamp']),
+        }
+
+        guitar_chart = {
+            'header': {
+                'difficulty': -1,
+                'is_metadata': 0,
+                'game_type': 1,
+            },
+            'beat_data': sorted(guitar_chart, key=lambda x:x['timestamp']),
+        }
+
+        bass_chart = {
+            'header': {
+                'difficulty': -1,
+                'is_metadata': 0,
+                'game_type': 2,
+            },
+            'beat_data': sorted(bass_chart, key=lambda x:x['timestamp']),
+        }
+
+        return base_chart, drum_chart, guitar_chart, bass_chart, sound_metadata
+
     def get_data(difficulty):
         output = {
             'drum': None,
             'guitar': None,
             'bass': None,
-            'open': None
+            'open': None,
+            'guitar1': None,
+            'guitar2': None
         }
 
         if 'input_split' not in params:
             return output
 
-        for part in ['drum', 'guitar', 'bass', 'open']:
+        for part in ['drum', 'guitar', 'bass', 'open', 'guitar1', 'guitar2']:
             if part in params['input_split'] and difficulty in params['input_split'][part]:
                 filename = params['input_split'][part][difficulty]
 
@@ -1679,16 +617,26 @@ def create_json_from_dtx(params):
         #     metadata4, chart_bass, sound_metadata = parse_dtx_to_intermediate(data['open'], params, sound_metadata, "open")
         #     metadatas.append(metadata4)
 
+        chart_guitar1 = None
+        # if "guitar1" in parts and 'guitar1' in data:
+        #     metadata5, chart_bass, sound_metadata = parse_dtx_to_intermediate(data['guitar1'], params, sound_metadata, "guitar1")
+        #     metadatas.append(metadata5)
+
+        chart_guitar2 = None
+        # if "guitar2" in parts and 'guitar2' in data:
+        #     metadata6, chart_bass, sound_metadata = parse_dtx_to_intermediate(data['guitar2'], params, sound_metadata, "guitar2")
+        #     metadatas.append(metadata6)
+
         metadatas = [x for x in metadatas if x is not None]  # Filter bad metadata charts
         metadata = None if len(metadatas) == 0 else metadatas[0]
 
-        return metadata, chart_drum, chart_guitar, chart_bass, chart_open, sound_metadata
+        return metadata, chart_drum, chart_guitar, chart_bass, chart_open, chart_guitar1, chart_guitar2, sound_metadata
 
-    novice_metadata, novice_chart_drum, novice_chart_guitar, novice_chart_bass, novice_chart_open, sound_metadata = get_chart_data(novice_data, sound_metadata, params['parts'])
-    basic_metadata, basic_chart_drum, basic_chart_guitar, basic_chart_bass, basic_chart_open, sound_metadata = get_chart_data(basic_data, sound_metadata, params['parts'])
-    adv_metadata, adv_chart_drum, adv_chart_guitar, adv_chart_bass, adv_chart_open, sound_metadata = get_chart_data(adv_data, sound_metadata, params['parts'])
-    ext_metadata, ext_chart_drum, ext_chart_guitar, ext_chart_bass, ext_chart_open, sound_metadata = get_chart_data(ext_data, sound_metadata, params['parts'])
-    master_metadata, master_chart_drum, master_chart_guitar, master_chart_bass, master_chart_open, sound_metadata = get_chart_data(master_data, sound_metadata, params['parts'])
+    novice_metadata, novice_chart_drum, novice_chart_guitar, novice_chart_bass, novice_chart_open, novice_chart_guitar1, novice_chart_guitar2, sound_metadata = get_chart_data(novice_data, sound_metadata, params['parts'])
+    basic_metadata, basic_chart_drum, basic_chart_guitar, basic_chart_bass, basic_chart_open, basic_chart_guitar1, basic_chart_guitar2, sound_metadata = get_chart_data(basic_data, sound_metadata, params['parts'])
+    adv_metadata, adv_chart_drum, adv_chart_guitar, adv_chart_bass, adv_chart_open, adv_chart_guitar1, adv_chart_guitar2, sound_metadata = get_chart_data(adv_data, sound_metadata, params['parts'])
+    ext_metadata, ext_chart_drum, ext_chart_guitar, ext_chart_bass, ext_chart_open, ext_chart_guitar1, ext_chart_guitar2, sound_metadata = get_chart_data(ext_data, sound_metadata, params['parts'])
+    master_metadata, master_chart_drum, master_chart_guitar, master_chart_bass, master_chart_open, master_chart_guitar1, master_chart_guitar2, sound_metadata = get_chart_data(master_data, sound_metadata, params['parts'])
 
     # Create sound metadata file
     # Any notes not in the drums or guitar sound metadata fields should be added to both just in case
@@ -1748,6 +696,10 @@ def create_json_from_dtx(params):
 
     metadata_charts = [x for x in [novice_metadata, basic_metadata, adv_metadata, ext_metadata, master_metadata] if x is not None]
 
+    for chart in metadata_charts:
+        chart['header']['difficulty'] = -1
+        chart['header']['is_metadata'] = 1
+
     if 'drum' not in params['parts']:
         novice_chart_drum = None
         basic_chart_drum = None
@@ -1769,6 +721,27 @@ def create_json_from_dtx(params):
         ext_chart_bass = None
         master_chart_bass = None
 
+    if 'open' not in params['parts']:
+        novice_chart_open = None
+        basic_chart_open = None
+        adv_chart_open = None
+        ext_chart_open = None
+        master_chart_open = None
+
+    if 'guitar1' not in params['parts']:
+        novice_chart_guitar1 = None
+        basic_chart_guitar1 = None
+        adv_chart_guitar1 = None
+        ext_chart_guitar1 = None
+        master_chart_guitar1 = None
+
+    if 'guitar2' not in params['parts']:
+        novice_chart_guitar2 = None
+        basic_chart_guitar2 = None
+        adv_chart_guitar2 = None
+        ext_chart_guitar2 = None
+        master_chart_guitar2 = None
+
     if 'guitar' not in params['parts'] and 'bass' not in params['parts']:
         sound_metadata_guitar = None
 
@@ -1777,11 +750,11 @@ def create_json_from_dtx(params):
             if chart:
                 chart['header']['difficulty'] = difficulty
 
-    novice_charts = [novice_chart_drum, novice_chart_guitar, novice_chart_bass]
-    basic_charts = [basic_chart_drum, basic_chart_guitar, basic_chart_bass]
-    adv_charts = [adv_chart_drum, adv_chart_guitar, adv_chart_bass]
-    ext_charts = [ext_chart_drum, ext_chart_guitar, ext_chart_bass]
-    master_charts = [master_chart_drum, master_chart_guitar, master_chart_bass]
+    novice_charts = [novice_chart_drum, novice_chart_guitar, novice_chart_bass, novice_chart_open, novice_chart_guitar1, novice_chart_guitar2]
+    basic_charts = [basic_chart_drum, basic_chart_guitar, basic_chart_bass, basic_chart_open, basic_chart_guitar1, basic_chart_guitar2]
+    adv_charts = [adv_chart_drum, adv_chart_guitar, adv_chart_bass, adv_chart_open, adv_chart_guitar1, adv_chart_guitar2]
+    ext_charts = [ext_chart_drum, ext_chart_guitar, ext_chart_bass, ext_chart_open, ext_chart_guitar1, ext_chart_guitar2]
+    master_charts = [master_chart_drum, master_chart_guitar, master_chart_bass, master_chart_open, master_chart_guitar1, master_chart_guitar2]
 
     set_chart_difficulty(novice_charts, 0)
     set_chart_difficulty(basic_charts, 1)
@@ -1803,969 +776,462 @@ def create_json_from_dtx(params):
     return json.dumps(output_json, indent=4, sort_keys=True)
 
 
-#########################
-#   DTX creation code   #
-#########################
+def create_dtx_from_json(params):
+    def generate_output_data(chart, game_type, division=192):
+        def get_last_bpm(bpms, offset):
+            last_bpm = 0
 
-def combine_charts(metadata, chart):
-    chart_combined = copy.deepcopy(chart)
+            for k in bpms:
+                if k <= offset:
+                    last_bpm = k
 
-    # Remove endpos command from chart but keep metadata's command
-    for k in sorted(chart_combined['timestamp'].keys(), key=lambda x: int(x)):
-        filter_list = ["endpos"]
-        chart_combined['timestamp'][k] = [x for x in chart_combined['timestamp'][k] if x['name'] not in filter_list]
+            return bpms[last_bpm]
 
-    for k in sorted(metadata['timestamp'].keys(), key=lambda x: int(x)):
-        if k not in chart_combined['timestamp']:
-            chart_combined['timestamp'][k] = []
 
-        for d in metadata['timestamp'][k]:
-            chart_combined['timestamp'][k].append(d)
+        def get_nearest_beat(beats, timestamp):
+            nearest_timestamp = 0
 
-    return chart_combined
+            for k in beats:
+                if timestamp == k:
+                    nearest_timestamp = k
+                    break
 
+                if abs(timestamp - k) < abs(timestamp - nearest_timestamp):
+                    nearest_timestamp = k
 
-def generate_hold_release_events(chart):
-    for k in sorted(chart['timestamp'].keys(), key=lambda x: int(x)):
-        for beat in chart['timestamp'][k]:
-            if beat['name'] == "note":
-                if 'guitar_special' in beat['data'] and beat['data']['guitar_special'] & 0x02:
-                    # Long note start
-                    new_note = copy.deepcopy(beat)
-                    new_note['name'] = "_note_start"
-
-                    if 'beat' in new_note:
-                        del new_note['beat']
-
-                    chart['timestamp'][k].append(new_note)
-
-                    # Long note end
-                    new_note = copy.deepcopy(beat)
-                    new_note['name'] = "_note_release"
-
-                    if 'beat' in new_note:
-                        del new_note['beat']
-
-                    #DD1 has a hold note that seems to end on bar without note but actual game still has it end earlier
-                    #Hyp also has hold note ending earlier than expected.
-                    timestamp_offset = 30 #0.1 sec
-                    while True:
-                        new_timestamp_int = int(k) + int(beat['data']['hold_duration']) - timestamp_offset
-                        new_timestamp = str(new_timestamp_int)
-
-                        #if new_timestamp not in chart['timestamp']:
-                        #    break
-
-                        found_note = False
-                        for delta in range(-7, 8):
-                            if str(new_timestamp_int + delta) in chart['timestamp']:                           
-                                for beat2 in chart['timestamp'][str(new_timestamp_int + delta)]:
-                                    if beat2['name'] == "note":
-                                        timestamp_offset += 30
-                                        found_note = True                                
-                                        break
-                            if found_note:
-                                break
-
-                        if not found_note:
-                            break
-
-                    if new_timestamp not in chart['timestamp']:
-                        chart['timestamp'][new_timestamp] = []
-
-                    chart['timestamp'][new_timestamp].append(new_note)
-
-    return chart
-
+            return beats[nearest_timestamp]
 
-def get_time_signatures_by_timestamp(chart):
-    time_signatures_by_timestamp = {}
 
-    for k in sorted(chart['timestamp'].keys(), key=lambda x: int(x)):
-        for beat in chart['timestamp'][k]:
-            if beat['name'] == "barinfo":
-                time_signatures_by_timestamp[k] = {
-                    'numerator': beat['data']['numerator'],
-                    'denominator': beat['data']['denominator'],
-                    'denominator_orig': Fraction2(beat['data']['numerator'], beat['data']['denominator']).denominator_orig,
-                    'timesig': beat['data']['numerator'] / beat['data']['denominator']
-                }
+        def get_measures(events):
+            measures = []
+            for event in events[:]:
+                if event['name'] == "measure": # Measure
+                    measures.append(event)
 
-    return time_signatures_by_timestamp
+                    for event2 in events:
+                        if event2['name'] == "beat" and event['timestamp'] == event2['timestamp']: # Beat
+                            events.remove(event2)
 
+            return measures
 
-def generate_time_signature_by_timestamp(chart):
-    time_signatures_by_timestamp = get_time_signatures_by_timestamp(chart)
 
-    # Generate a time_signature field for everything based on timestamp
-    for k in sorted(chart['timestamp'].keys(), key=lambda x: int(x)):
-        idx = [x for x in sorted(time_signatures_by_timestamp.keys(), key=lambda x: int(x)) if int(x) <= int(k)][-1]
-        time_signature = time_signatures_by_timestamp[idx]
+        def get_bpm_per_measure(measures):
+            bpm_per_measure = {}
 
-        for idx in range(len(chart['timestamp'][k])):
-            chart['timestamp'][k][idx]['time_signature'] = time_signature
+            for i in range(0, len(measures) - 1):
+                time_diff = measures[i+1]['timestamp'] - measures[i]['timestamp']
+                bpm = 300 / (time_diff / 4 / 60)
+                bpm_per_measure[measures[i]['timestamp']] = bpm
 
-    return chart
+            return bpm_per_measure
 
 
-def force_dtx_time_signatures(chart):
-    # Find time signatures that aren't x/4 and make them x/4 with approprate BPM changes
+        def get_bpm_list(bpm_per_measure):
+            bpm_list = []
 
-    last_bpm = None
-    last_bpm_k = None
-    last_bpm_real = None
-    is_mod_bpm = False
-    for k in sorted(chart['timestamp'].keys(), key=lambda x: int(x)):
-        for data in chart['timestamp'][k]:
-            if data['name'] == "bpm":
-                last_bpm = data
-                last_bpm_k = k
-                last_bpm_real = data
-                is_mod_bpm = False
+            for k in bpm_per_measure:
+                bpm = bpm_per_measure[k]
 
-        for data in chart['timestamp'][k]:
-            if data['name'] == "barinfo":
-                if data['data']['denominator'] != 4:
-                    diff = data['data']['denominator'] / 4
-                    data['data']['denominator'] = 4
-                    data['data']['denominator_orig'] = 2
+                if bpm not in bpm_list:
+                    bpm_list.append(bpm)
 
-                    if last_bpm_k == k:
-                        # Replace BPM in current timestamp
-                        for data2 in chart['timestamp'][k]:
-                            if data2['name'] == "bpm":
-                                data2['data']['bpm'] *= diff
-                    else:
-                        # Add new BPM command
-                        new_bpm = copy.deepcopy(last_bpm_real)
-                        new_bpm['beat'] = data['beat']
-                        new_bpm['data']['bpm'] *= diff
-                        chart['timestamp'][k].append(new_bpm)
-                        last_bpm = new_bpm
-                        last_bpm_k = k
+            return bpm_list
 
-                    is_mod_bpm = True
-                else:
-                    if is_mod_bpm:
-                        # Add new BPM command
-                        new_bpm = copy.deepcopy(last_bpm_real)
-                        new_bpm['beat'] = data['beat']
-                        chart['timestamp'][k].append(new_bpm)
-                        last_bpm = new_bpm
-                        last_bpm_k = k
 
+        def calculate_timestamp_mapping(events, measures, bpm_per_measure, division=192):
+            cur_pos = 0
+            mapping = {}
 
-    return chart
+            last_measure = None
 
+            for measure_idx, measure in enumerate(measures):
+                last_measure = measure
+                bpm = get_last_bpm(bpm_per_measure, measure['timestamp'])
+                beat_duration = ((4 * (1/bpm)) * 60) / division
 
-def generate_metadata_fields(metadata, chart, is_forced_dtx_time_signatures=False):
-    # Generate and add any important data that isn't guaranteed to be there (namely, beat markers for SQ3)
+                for i in range(0, division):
+                    mapping[cur_pos] = (measure_idx, i)
+                    cur_pos = cur_pos + beat_duration
 
-    if 'beat_division' not in metadata['header']:
-        metadata['header']['beat_division'] = 480
+            last_event = sorted(events, key=lambda x:x['timestamp'])[-1]
+            last_event_timestamp = last_event['timestamp_ms']
 
-    if 'time_division' not in metadata['header']:
-        metadata['header']['time_division'] = 300
+            while cur_pos < last_event_timestamp:
+                measure_idx += 1
 
-    chart = combine_charts(metadata, chart)
+                bpm = get_last_bpm(bpm_per_measure, last_measure['timestamp'])
+                beat_duration = ((4 * (1/bpm)) * 60) / division
 
-    if is_forced_dtx_time_signatures:
-        chart = force_dtx_time_signatures(chart)
+                for i in range(0, division):
+                    mapping[cur_pos] = (measure_idx, i)
+                    cur_pos = cur_pos + beat_duration
 
-    chart = generate_hold_release_events(chart)
-    chart = generate_time_signature_by_timestamp(chart)
+            return mapping
 
-    return chart
 
+        def get_events_from_chart(chart):
+            events = []
 
-def get_chart_data_by_measure_beat(chart_data):
-    chart_data_sorted = {}
-
-    for k in sorted(chart_data['timestamp'].keys(), key=lambda x: int(x)):
-        for idx in range(len(chart_data['timestamp'][k])):
-            measure = chart_data['timestamp'][k][idx]['metadata']['measure']
-            beat = chart_data['timestamp'][k][idx]['metadata']['beat']
-
-            if measure not in chart_data_sorted:
-                chart_data_sorted[measure] = {}
-
-            if beat not in chart_data_sorted[measure]:
-                chart_data_sorted[measure][beat] = []
-
-            d = chart_data['timestamp'][k][idx]
-            d['timestamp'] = k
-            chart_data_sorted[measure][beat].append(d)
-
-    return chart_data_sorted
-
-
-def calculate_time_signatures_by_timestamp(chart_data):
-    time_signatures_by_timestamp = {}
-    last_timesig_timestamp = 0
-
-    for k in sorted(chart_data['timestamp'].keys(), key=lambda x: int(x)):
-        found_timesig = False
-
-        for beat in chart_data['timestamp'][k]:
-            if beat['name'] == "barinfo":
-                time_signatures_by_timestamp[k] = {
-                    'numerator': beat['data']['numerator'],
-                    'denominator': beat['data']['denominator'],
-                    'denominator_orig': Fraction2(beat['data']['numerator'], beat['data']['denominator']).denominator_orig,
-                    'timesig': beat['data']['numerator'] / beat['data']['denominator']
-                }
-
-                last_timesig_timestamp = k
-                found_timesig = True
-
-        if not found_timesig and last_timesig_timestamp in time_signatures_by_timestamp:
-            time_signatures_by_timestamp[k] = time_signatures_by_timestamp[last_timesig_timestamp]
-
-    return time_signatures_by_timestamp
-
-
-def add_time_signature_to_events(chart_data):
-    time_signatures_by_timestamp = calculate_time_signatures_by_timestamp(chart_data)
-
-    # Generate a time_signature field for everything based on timestamp
-    time_signatures_by_timestamp_keys = list(sorted(time_signatures_by_timestamp.keys(), key=lambda x: int(x)))
-    last_idx = 0
-    for k in sorted(chart_data['timestamp'].keys(), key=lambda x: int(x)):
-        idx = [x for x in time_signatures_by_timestamp_keys[last_idx:] if int(x) <= int(k)][-1]
-        last_idx = time_signatures_by_timestamp_keys.index(idx)
-
-        time_signature = time_signatures_by_timestamp[idx]
-
-        for idx in range(len(chart_data['timestamp'][k])):
-            chart_data['timestamp'][k][idx]['time_signature'] = time_signature
-
-    return chart_data
-
-
-def generate_measure_beat_for_chart(chart_data):
-    chart_data = add_time_signature_to_events(chart_data)
-
-    measure = -1
-    beat = 0
-    last_measure_timestamp = 0
-    last_timesig = {'numerator': 4, 'denominator': 4}
-    cur_bpm = None
-    base_beat = 0
-    for k in sorted(chart_data['timestamp'].keys(), key=lambda x: int(x)):
-        for idx in range(len(chart_data['timestamp'][k])):
-            if chart_data['timestamp'][k][idx]['name'] == "measure":
-                measure += 1
-                beat = 0
-                last_measure_timestamp = int(k)
-                last_timesig = chart_data['timestamp'][k][idx]['time_signature']
-                base_beat = beat
-
-            elif chart_data['timestamp'][k][idx]['name'] == "beat":
-                #beat += int(round(1920 * (chart_data['timestamp'][k][idx]['time_signature']['numerator'] / chart_data['timestamp'][k][idx]['time_signature']['denominator']) / chart_data['timestamp'][k][idx]['time_signature']['numerator']))
-                beat = base_beat + (1920 // chart_data['timestamp'][k][idx]['time_signature']['denominator'])
-                last_measure_timestamp = int(k)
-                last_timesig = chart_data['timestamp'][k][idx]['time_signature']
-                base_beat = beat
-
-            elif chart_data['timestamp'][k][idx]['name'] == "barinfo":
-                last_measure_timestamp = int(k)
-                last_timesig = chart_data['timestamp'][k][idx]['time_signature']
-
-            elif cur_bpm == None and chart_data['timestamp'][k][idx]['name'] == "bpm":
-                cur_bpm = chart_data['timestamp'][k][idx]['data']['bpm']
-                last_timesig = chart_data['timestamp'][k][idx]['time_signature']
-
-        # Calculate the difference between the current beat's timestamp and
-        # the current note's timestamp Then calculate the beat difference
-        # between those two
-        diff = int(k) - last_measure_timestamp
-        diff_sec = diff / 300
-        diff_sec *= int(round(last_timesig['denominator_orig'] / 2))
-        beats_per_sec = cur_bpm / 60
-        measure_size = int((1920 / last_timesig['denominator']) * last_timesig['numerator'])
-        beat_diff = (diff_sec * beats_per_sec) * (1920 // last_timesig['denominator'])
-
-        measure_diff = 0
-        # if beat + beat_diff >= measure_size:
-        #     measure_diff = (beat + beat_diff) // measure_size
-        #     beat_diff = (beat + beat_diff) - (measure_diff * measure_size)
-        #     final_beat = beat_diff
-        #     print(measure + measure_diff, beat + beat_diff)
-        # else:
-        #     final_beat = beat + round(beat_diff)
-
-        final_beat = beat + round(beat_diff)
-        final_beat *= int(last_timesig['denominator_orig'] / 2)
-
-        for idx in range(len(chart_data['timestamp'][k])):
-            chart_data['timestamp'][k][idx]['beat'] = 0
-            chart_data['timestamp'][k][idx]['metadata'] = {
-                'measure': measure + measure_diff if measure + measure_diff >= 0 else 0,
-                'beat': int(round(final_beat)),
-            }
-
-        for idx in range(len(chart_data['timestamp'][k])):
-            if chart_data['timestamp'][k][idx]['name'] == "bpm":
-                cur_bpm = chart_data['timestamp'][k][idx]['data']['bpm']
-                last_timesig = chart_data['timestamp'][k][idx]['time_signature']
-                last_measure_timestamp = int(k)
-                beat = int(round(final_beat))
-
-    return chart_data
-
-
-def get_clipped_wav(sound_metadata, sound_entry, duration):
-    # Check if a clipped WAV exists of the same length
-    # If one exists, return the existing entry
-    # Otherwise return a newly created entry
-    clipped_wav_entry = None
-
-    duration = round(duration, 3) # Pydub only can handle 3 decimal places
-
-    for entry in sound_metadata['entries']:
-        if not entry.get('clipped', False):
-            continue
-
-        if entry['filename'] == sound_entry['filename'] and entry['duration'] == duration:
-            return entry
-
-    next_sound_id = 100
-    for entry in sound_metadata['entries']:
-        if entry['sound_id'] >= next_sound_id:
-            next_sound_id = entry['sound_id'] + 1
-
-    clipped_wav_entry = copy.deepcopy(sound_entry)
-    clipped_wav_entry['sound_id'] = next_sound_id
-    clipped_wav_entry['clipped'] = True
-    clipped_wav_entry['duration'] = duration
-    sound_metadata['entries'].append(clipped_wav_entry)
-
-    if "NoFilename" not in sound_entry['flags']:
-        orig_wav_filename = "%s.wav" % (sound_entry['filename'])
-    else:
-        orig_wav_filename = "%04d.wav" % (next_sound_id)
-
-    if "NoFilename" not in sound_entry['flags']:
-        wav_filename = "_override_clipped_%d_%s.wav" % (next_sound_id, sound_entry['filename'])
-    else:
-        wav_filename = "_override_clipped_%d_%04d.wav" % (next_sound_id, next_sound_id)
-
-    sound_folder = sound_metadata['sound_folder'] if sound_metadata['sound_folder'] else ""
-    orig_wav_filename = os.path.join(sound_folder, orig_wav_filename)
-    wav_filename = os.path.join(sound_folder, wav_filename)
-
-    if not os.path.exists(orig_wav_filename):
-        return None
-
-    audio.clip_audio(orig_wav_filename, wav_filename, duration)
-
-    return clipped_wav_entry
-
-
-def generate_dtx_info(chart_data, sound_metadata, game_type):
-    sound_keys = [""]
-
-    sound_files = {}
-    volumes = {}
-    pans = {}
-    bpms = []
-    dtx_info = {}
-    cur_bpm = None
-
-    last_sound_was_mutable = False
-    last_played_note = None
-
-    # TODO: Refactor this more eventually if possible
-    for measure in sorted(chart_data.keys(), key=lambda x: int(x)):
-        for beat in sorted(chart_data[measure].keys(), key=lambda x: int(x)):
-            for idx in range(len(chart_data[measure][beat])):
-                cd = chart_data[measure][beat][idx]
-
-                if not cd['name'] in ['note']:
-                    continue
-
-                if 'pan' not in cd['data']:
-                    chart_data[measure][beat][idx]['data']['pan'] = 64
-
-                if 'volume' not in cd['data']:
-                    chart_data[measure][beat][idx]['data']['volume'] = 127
-
-                pan = 64  # Center
-                volume = 127  # 100% volume
-                if sound_metadata and 'entries' in sound_metadata:
-                    for sound_entry in sound_metadata['entries']:
-                        if sound_entry['sound_id'] == cd['data']['sound_id']:
-                            if 'volume' in sound_entry:
-                                volume = sound_entry['volume']
-                            if 'pan' in sound_entry:
-                                pan = sound_entry['pan']
-                            break
-
-                pan_final = 0
-                if cd['data'].get('pan') != 64:
-                    pan_final = int(round((cd['data']['pan'] - ((128 - pan) / 2)) / 64 * 100))
-                elif pan != 64:
-                    pan_final = int(round((pan - 64) / 64 * 100))
-
-                # Calculate correct pan
-                # TODO: Put this behind some kind of flag check since it's probably not required for anything before Gitadora
-                if (cd['data']['note'] in ['leftcymbal', 'hihat'] and pan_final > 0) or (cd['data']['note'] in ['floortom', 'rightcymbal'] and pan_final < 0):
-                    pan_final = -pan_final
-
-                chart_data[measure][beat][idx]['data']['pan'] = pan_final
-
-                #volume = 127  # 100% volume
-                volume_final = 100
-                if cd['data'].get('volume') != 127:
-                    volume_final = int(round((cd['data']['volume'] / 127) * (volume / 127) * 100))
-                elif volume != 127:
-                    volume_final = int(round((volume / 127) * 100))
-
-                chart_data[measure][beat][idx]['data']['volume'] = volume_final
-
-            is_mutable_sound = False
-            mutable_sound_data = None
-
-            for cd in chart_data[measure][beat]:
-                if not cd['name'] in ['note', 'auto']:
-                    continue
-
-                if cd['data']['sound_id'] >= 100 and game_type == 0:
-                    is_mutable_sound = True
-                    mutable_sound_data = cd
-
-            if is_mutable_sound:
-                for idx in range(len(chart_data[measure][beat])):
-                    if not chart_data[measure][beat][idx]['name'] in ['note', 'auto']:
+            for event in sorted(chart['beat_data'], key=lambda x:x['timestamp']):
+                events.append(event)
+
+            return events
+
+
+        def simplify_measures(chart):
+            def can_divide_measure(measure, n):
+                div = len(measure) // n
+
+                for j in range(0, div):
+                    for k in range(1, n):
+                        if measure[(j * n) + k] != 0:
+                            return False
+
+                return True
+
+            for measure_idx in output_data:
+                for event in list(output_data[measure_idx].keys()):
+                    # Remove empty measures
+                    if len([x for x in output_data[measure_idx][event] if x != 0]) == 0:
+                        del output_data[measure_idx][event]
                         continue
 
-                    if chart_data[measure][beat][idx]['data']['sound_id'] < 100:
-                        continue
+                    # Simplify all measures that are evenly divisible
+                    div_size = 1
+                    for i in range(1, len(output_data[measure_idx][event]) + 1):
+                        if len(output_data[measure_idx][event]) % i != 0:
+                            continue
 
-                    # Only the last played mutable sound is actually audible in-game
-                    if chart_data[measure][beat][idx]['data']['sound_id'] != mutable_sound_data['data']['sound_id']:
-                        chart_data[measure][beat][idx]['data']['volume'] = 0
+                        if can_divide_measure(output_data[measure_idx][event], i):
+                            div_size = i
 
-            for cd in chart_data[measure][beat]:
-                if measure not in dtx_info:
-                    dtx_info[measure] = {}
+                    output_data[measure_idx][event] = [output_data[measure_idx][event][x] for x in range(0, len(output_data[measure_idx][event]), div_size)]
 
-                if cd['name'] == "bpm":
-                    bpms.append(cd['data']['bpm'])
+            return output_data
 
-                    if measure in dtx_info and 0x08 not in dtx_info[measure]:
-                        numerator = cd['time_signature']['numerator']
-                        denominator = cd['time_signature']['denominator']
-                        beat_division = int((1920 / denominator) * numerator)
-                        dtx_info[measure][0x08] = ['00'] * beat_division
-                    d = dtx_info[measure][0x08]
-                    d[beat] = base_repr(len(bpms), 36, padding=2).upper()[-2:]
-                    cur_bpm = cd['data']['bpm']
+        def generate_hold_release_events(events):
+            _events = []
+            for event in events:
+                _events.append(event)
 
-                    dtx_info[measure][0x08] = d
+                if event['name'] == "note":
+                    if 'guitar_special' in event['data'] and event['data']['guitar_special'] & 0x02:
+                        # Long note start
+                        new_note = copy.deepcopy(event)
+                        new_note['name'] = "_note_start"
 
-                elif cd['name'] == "barinfo":
-                    if measure in dtx_info and 0x02 not in dtx_info[measure]:
-                        dtx_info[measure][0x02] = {}
+                        _events.append(new_note)
 
-                    dtx_info[measure][0x02] = ["{}".format(
-                        cd['time_signature']['numerator'] / cd['time_signature']['denominator']
-                    )]
+                        # Long note end
+                        new_note = copy.deepcopy(event)
+                        new_note['name'] = "_note_release"
 
-                elif cd['name'] == "baron":
-                    if measure in dtx_info and 0xc2 not in dtx_info[measure]:
-                        numerator = cd['time_signature']['numerator']
-                        denominator = cd['time_signature']['denominator']
-                        beat_division = int((1920 / denominator) * numerator)
-                        dtx_info[measure][0xc2] = ['00'] * beat_division
+                        timestamp_offset = 0
+                        while True:
+                            new_timestamp = event['timestamp'] + event['data']['hold_duration'] - timestamp_offset
 
-                    d = dtx_info[measure][0xc2]
-                    d[beat] = base_repr(0x01, 36, padding=2).upper()[-2:]
-
-                    dtx_info[measure][0xc2] = d
-
-                elif cd['name'] == "baroff":
-                    if measure in dtx_info and 0xc2 not in dtx_info[measure]:
-                        numerator = cd['time_signature']['numerator']
-                        denominator = cd['time_signature']['denominator']
-                        beat_division = int((1920 / denominator) * numerator)
-                        dtx_info[measure][0xc2] = ['00'] * beat_division
-
-                    d = dtx_info[measure][0xc2]
-                    d[beat + 10] = base_repr(0x02, 36, padding=2).upper()[-2:] #baroff should be right after barline, not on barline itself
-
-                    dtx_info[measure][0xc2] = d
-
-                elif cd['name'] == "endpos":
-                    if measure in dtx_info and 0x61 not in dtx_info[measure]:
-                        numerator = cd['time_signature']['numerator']
-                        denominator = cd['time_signature']['denominator']
-                        beat_division = int((1920 / denominator) * numerator)
-                        dtx_info[measure][0x61] = ['00'] * beat_division
-
-                    d = dtx_info[measure][0x61]
-                    #For some songs, beat is 1920 which is off index
-                    if beat in d:
-                        d[beat] = base_repr(1294, 36, padding=2).upper()[-2:] #1294 is ZY, which we assume no chip sound, or we can reserve it as empty
-                    else:
-                        pass #avoid putting endpos for this case for now since only 8 songs affected. Manually place the endpos if it effects ending
-
-                    dtx_info[measure][0x61] = d
-
-                elif cd['name'] in ["_note_start", "_note_release"]:
-                    # This is an automatically generated event based on
-                    # guitar_special and note_length
-                    longnote_field = [-1, 0x2c, 0x2d, 0x2c][game_type]
-
-                    if measure in dtx_info and longnote_field not in dtx_info[measure]:
-                        numerator = cd['time_signature']['numerator']
-                        denominator = cd['time_signature']['denominator']
-                        beat_division = int((1920 / denominator) * numerator)
-                        dtx_info[measure][longnote_field] = ['00'] * beat_division
-
-                    d = dtx_info[measure][longnote_field]
-                    d[beat] = base_repr(0x01, 36, padding=2).upper()[-2:]
-
-                    dtx_info[measure][longnote_field] = d
-
-                elif cd['name'] == "note":
-                    if is_mutable_sound and last_sound_was_mutable:
-                        # Sound id >= 100
-                        # Only one mutable sound can be played at once
-                        sound_entry = None
-                        if sound_metadata and 'entries' in sound_metadata:
-                            for sound_entry in sound_metadata['entries']:
-                                if sound_entry['sound_id'] == last_played_note['data']['data']['sound_id']:
+                            found_note = False
+                            for event2 in events:
+                                if event2['timestamp'] == new_timestamp and event2['name'] == "note":
+                                    found_note = True
+                                    timestamp_offset += 1
                                     break
 
-                        if sound_entry:
-                            time_diff = (int(cd['timestamp']) - int(last_played_note['data']['timestamp'])) / 300
-
-                            if time_diff < sound_entry['duration']:
-                                # Set last_played_note['data']['sound_id'] to new sound id of clipped WAV
-                                # Create list of WAVs to be clipped once parsing is done
-                                clipped_wav_metadata = get_clipped_wav(sound_metadata, sound_entry, time_diff)
-
-                                if clipped_wav_metadata:
-                                    prev_sound_id = last_played_note['data']['data']['sound_id']
-                                    last_played_note['data']['data']['sound_id'] = clipped_wav_metadata['sound_id']
-
-                                    mapped_note = dtx_mapping[last_played_note['data']['data']['note']]
-                                    d = dtx_info[last_played_note['measure']][mapped_note]
-
-                                    # TODO: Refactor so this and the next instance of the same code are in their own function
-                                    sound_key = "%04d_%03d_%03d" % (
-                                        last_played_note['data']['data']['sound_id'],
-                                        last_played_note['data']['data']['volume'],
-                                        last_played_note['data']['data']['pan']
-                                    )
-
-                                    prev_sound_key = "%04d_%03d_%03d" % (
-                                        prev_sound_id,
-                                        last_played_note['data']['data']['volume'],
-                                        last_played_note['data']['data']['pan']
-                                    )
-
-                                    if sound_key not in sound_keys:
-                                        sound_keys.append(sound_key)
-                                        sound_id = sound_keys.index(sound_key)
-                                        prev_sound_id = sound_keys.index(prev_sound_key)
-
-                                        sound_files[sound_id] = last_played_note['data']['data']['sound_id']
-                                        volumes[sound_id] = volumes[prev_sound_id]
-                                        pans[sound_id] = pans[prev_sound_id]
-
-                                    sound_id = sound_keys.index(sound_key)
-                                    d[last_played_note['beat']] = base_repr(sound_id, 36, padding=2).upper()[-2:]
-                                    dtx_info[last_played_note['measure']][mapped_note] = d
-
-                    mapped_note = dtx_mapping[cd['data']['note']]
-
-                    # Fix mapped note for autoplay sounds
-                    if mapped_note in auto_play_ranges:
-                        while measure in dtx_info and mapped_note in dtx_info[measure]:
-                            d = dtx_info[measure][mapped_note]
-
-                            if d[beat] != "00" and mapped_note in auto_play_ranges:
-                                if auto_play_ranges.index(mapped_note) + 1 >= len(auto_play_ranges):
-                                    print("Ran out of auto play spaces")
-                                    exit(1)
-
-                                idx = auto_play_ranges.index(mapped_note)
-                                mapped_note = auto_play_ranges[idx + 1]
-                            else:
+                            if not found_note:
                                 break
 
-                    if measure in dtx_info and mapped_note not in dtx_info[measure]:
-                        numerator = cd['time_signature']['numerator']
-                        denominator = cd['time_signature']['denominator']
-                        beat_division = int((1920 / denominator) * numerator)
-                        dtx_info[measure][mapped_note] = ['00'] * beat_division
+                        new_note['timestamp'] = new_timestamp
+                        new_note['timestamp_ms'] = new_timestamp / 300
 
-                    d = dtx_info[measure][mapped_note]
+                        _events.append(new_note)
 
-                    if 'auto_volume' in cd['data']:
-                        if 'auto_note' not in cd['data'] or cd['data'].get('auto_note') == 1:
-                            if cd['data']['auto_volume']:
-                                # Change 2/3 later if other games use different ratios
-                                cd['data']['volume'] = int(round(cd['data']['volume'] * (2/3)))
+            return _events
 
-                    sound_key = "%04d_%03d_%03d" % (
-                        cd['data']['sound_id'],
-                        cd['data']['volume'],
-                        cd['data']['pan']
-                    )
 
-                    if sound_key not in sound_keys:
-                        sound_keys.append(sound_key)
-                        sound_id = sound_keys.index(sound_key)
-                        sound_files[sound_id] = cd['data']['sound_id']
-                        volumes[sound_id] = cd['data']['volume']
-                        pans[sound_id] = cd['data']['pan']
+        def generate_sound_id_map(events):
+            used_sound_ids = {}
+            sound_id_lookup = {}
 
-                    #print(measure, len(d), beat, cd['time_signature'], cur_bpm)
+            cur_sound_id = 1
 
+            for event in events:
+                if event['name'] == "note":
+                    sound_key = "%d_%d" % (event['data']['sound_id'], event['data'].get('note_length', 0))
+
+                    if sound_key not in sound_id_lookup:
+                        sound_id_lookup[sound_key] = cur_sound_id
+                        used_sound_ids[cur_sound_id] = {
+                            'sound_id': event['data']['sound_id'],
+                            'filename': "%04x" % event['data']['sound_id'],
+                            'duration': event['data'].get('note_length', 0)
+                        }
+                        cur_sound_id += 1
+
+                    event['data']['sound_id'] = sound_id_lookup[sound_key]
+
+            return events, used_sound_ids
+
+
+        events = get_events_from_chart(chart)
+        events, used_sound_ids = generate_sound_id_map(events)
+        events = generate_hold_release_events(events)
+        measures = get_measures(events)
+        bpm_per_measure = get_bpm_per_measure(measures)
+        bpm_list = get_bpm_list(bpm_per_measure)
+        mapping = calculate_timestamp_mapping(events, measures, bpm_per_measure, division)
+
+        display_bar = True
+
+        output_data = {}
+        sound_keys = [None]
+        sound_info = {}
+        for event in events:
+            measure_idx, beat_idx = get_nearest_beat(mapping, event['timestamp_ms'])
+
+            if measure_idx not in output_data:
+                output_data[measure_idx] = {
+                    0x08: [0x00] * division, # BPM
+                    0x50: [0x00] * division, # Show measure bar
+                    0x51: [0x00] * division, # Show beat bar
+                    0x2c: [0x00] * division, # Guitar long note
+                    0x2d: [0x00] * division, # Bass long note
+                    0xc2: [0x00] * division, # End position
+                    0x28: [0x00] * division, # Guitar Wail
+                    0xa8: [0x00] * division, # Bass Wail
+                    0x4c: [0x00] * division, # Bonus note #1
+                    0x4d: [0x00] * division, # Bonus note #2
+                    0x4e: [0x00] * division, # Bonus note #3
+                    0x4f: [0x00] * division, # Bonus note #4
+                }
+
+                for k in reverse_dtx_mapping:
+                    output_data[measure_idx][k] = [0x00] * division
+
+                for k in auto_play_ranges:
+                    output_data[measure_idx][k] = [0x00] * division
+
+            if event['timestamp'] in bpm_per_measure:
+                output_data[measure_idx][0x08][beat_idx] = bpm_list.index(bpm_per_measure[event['timestamp']]) + 1
+
+            if event['name'] == "baron":
+                display_bar = True
+
+            elif event['name'] == "baroff":
+                display_bar = False
+
+            elif event['name'] == "endpos":
+                output_data[measure_idx][0xc2][beat_idx] = 0x01
+
+            elif event['name'] == "measure":
+                output_data[measure_idx][0x50][beat_idx] = 0x01 if display_bar else 0x00
+
+            elif event['name'] == "beat":
+                output_data[measure_idx][0x51][beat_idx] = 0x01 if display_bar else 0x00
+
+            elif event['name'] == "note":
+                sound_key = "%04d_%03d" % (
+                    event['data']['sound_id'],
+                    event['data']['volume'],
+                )
+
+                if sound_key not in sound_keys:
+                    sound_keys.append(sound_key)
                     sound_id = sound_keys.index(sound_key)
-                    d[beat] = base_repr(sound_id, 36, padding=2).upper()[-2:]
-                    dtx_info[measure][mapped_note] = d
+                    sound_info[sound_id] = {
+                        'sound_id': event['data']['sound_id'],
+                        'volume': event['data']['volume'],
+                    }
 
-                    # Wail support
-                    if 'guitar_special' in cd['data'] and cd['data']['guitar_special'] & 0x01:
-                        if cd['data']['wail_misc'] == 2:
-                            # Down wail
-                            # Currently down wailing isn't supported by any simulator,
-                            # so just use up wail's commands for now
-                            wail_field = [-1, 0x28, 0xa8, 0x28][game_type]
-                        else:  # 0, 1, ?
-                            # Up wail
-                            wail_field = [-1, 0x28, 0xa8, 0x28][game_type]
+                sound_id = sound_keys.index(sound_key)
 
-                        if measure in dtx_info and wail_field not in dtx_info[measure]:
-                            numerator = cd['time_signature']['numerator']
-                            denominator = cd['time_signature']['denominator']
-                            timesig = numerator / denominator
-                            beat_division = int(1920 * timesig)
-                            dtx_info[measure][wail_field] = ['00'] * beat_division
-
-                        wail_d = dtx_info[measure][wail_field]
-                        wail_d[beat] = d[beat]
-
-                        dtx_info[measure][wail_field] = wail_d
-
-                    # Bonus note support
-                    if cd['data'].get('bonus_note') and cd['data']['note'] in dtx_bonus_mapping:
-                        bonus_note_lane = 0x4f
-
-                        while bonus_note_lane >= 0x4c:
-                            if measure in dtx_info and bonus_note_lane not in dtx_info[measure]:
-                                numerator = cd['time_signature']['numerator']
-                                denominator = cd['time_signature']['denominator']
-                                beat_division = int((1920 / denominator) * numerator)
-                                dtx_info[measure][bonus_note_lane] = ['00'] * beat_division
-
-                            bonus_d = dtx_info[measure][bonus_note_lane]
-
-                            if bonus_d[beat] != "00":
-                                bonus_note_lane -= 1
-                                continue
-
-                            bonus_d[beat] = base_repr(dtx_bonus_mapping[cd['data']['note']], 16, padding=2).upper()[-2:]
-
-                            dtx_info[measure][bonus_note_lane] = bonus_d
+                if event['data']['note'] == "auto":
+                    for note in auto_play_ranges:
+                        if output_data[measure_idx][note][beat_idx] == 0:
                             break
 
-                        if bonus_note_lane < 0x4c:
-                            print("Couldn't find enough bonus note lanes")
+                    output_data[measure_idx][note][beat_idx] = sound_id
 
+                else:
+                    output_data[measure_idx][dtx_mapping[event['data']['note']]][beat_idx] = sound_id
 
-            last_sound_was_mutable = is_mutable_sound
+                if 'guitar_special' in event['data'] and event['data']['guitar_special'] & 0x01:
+                    if event['data']['wail_misc'] == 2:
+                        # Down wail
+                        # Currently down wailing isn't supported by any simulator,
+                        # so just use up wail's commands for now
+                        wail_field = {
+                            'd': -1,
+                            'g': 0x28,
+                            'b': 0xa8,
+                            'o': 0x28,
+                            'g1': 0x28,
+                            'g2': 0xa8,
+                        }[game_type]
 
-            if is_mutable_sound:
-                last_played_note = {
-                    'data': mutable_sound_data,
-                    'measure': measure,
-                    'beat': beat,
-                }
-            else:
-                last_played_note = None
+                        wail_direction = 2
 
-    return dtx_info, bpms, sound_files, volumes, pans
+                    else:  # 0, 1, ?
+                        # Up wail
+                        wail_field = {
+                            'd': -1,
+                            'g': 0x28,
+                            'b': 0xa8,
+                            'o': 0x28,
+                            'g1': 0x28,
+                            'g2': 0xa8,
+                        }[game_type]
 
-def downscale_beat_division_dtx_chart(input_dtx_info):
-    
-    output_dtx_info = input_dtx_info
-    #Reduce from 1920 divisions to 192 as that is the max supported in dtx
-    for measure in sorted(output_dtx_info.keys(), key=lambda x: int(x)):
-        for key in sorted(output_dtx_info[measure].keys(), key=lambda x: int(x)):
-            if( len(output_dtx_info[measure][key]) >= 10):
-                in_length = len(output_dtx_info[measure][key])
-                out_length = in_length // 10
-                new_array = ['00'] * out_length
-                temp_new_object = []
-                for x in range(0, in_length):
-                    if(output_dtx_info[measure][key][x] != '00'):
-                        #Round x to nearest integer after divide by 10 
-                        num_y = int(round(x/10.0))
-                        
-                        #if num_y happens to be equal to out_length, move the note to the next measure at the zeroth position!
-                        if(num_y >= out_length):
-                            next_measure = measure + 1
-                            if(next_measure < len(output_dtx_info)):
-                                #Check if key exist
-                                if(not key in output_dtx_info[next_measure]):
-                                    #Get any bar length change member from next_measure if any
-                                    next_measure_length = in_length
-                                    if(2 in output_dtx_info[next_measure]):
-                                        next_measure_length = int(float(output_dtx_info[next_measure][2][0]) * 1920)
-                                    #Create new key for next measure
-                                    output_dtx_info[next_measure][key] = ['00'] * next_measure_length
-                                
-                                output_dtx_info[next_measure][key][0] = output_dtx_info[measure][key][x]
-                                output_dtx_info[measure][key][x] = '00'
-                            else:
-                                print('Warning: note removed at last measure!')
-                        else:                            
-                            #Problem: Later values within 5 beat division will overwrite previous values
-                            #but it shouldn't happen because game never have notes so close to one another
-                            new_array[num_y] = output_dtx_info[measure][key][x]
-                            temp_new_object.append({
-                                'index': num_y,
-                                'value': new_array[num_y]
-                            })
-                #TODO: Further reduce out_length based on HCF or GCD
-                #Find GCD of all index in temp_new_object                
-                gcd = 0
-                len_new_object = len(temp_new_object)
-                for tIndex in range(0, len_new_object):
-                    gcd = math.gcd(gcd, temp_new_object[tIndex]['index'])                    
-                    if(tIndex == len_new_object - 1):
-                        gcd = math.gcd(gcd, out_length)
-                
-                #print('Measure:', measure, ' has GCD of' , gcd)
-                #Replace new_array with the reduced length
-                if(gcd > 0):
-                    new_array = ['00'] * (out_length // gcd)
-                    #Put the chip values back
-                    for tIndex in range(0, len_new_object):
-                        reducedIndex = temp_new_object[tIndex]['index'] // gcd
-                        new_array[reducedIndex] = temp_new_object[tIndex]['value']
+                        wail_direction = 1
 
-                #Overwrite with new reduced array 
-                output_dtx_info[measure][key] = new_array
+                    output_data[measure_idx][wail_field][beat_idx] = wail_direction
 
-    return output_dtx_info
+                if event['data'].get('bonus_note') and event['data']['note'] in dtx_bonus_mapping:
+                    bonus_note_lane = 0x4f
 
-def generate_dtx_chart_from_json(metadata, orig_chart_data, sound_metadata, params):
-    game_type = orig_chart_data['header']['game_type']
+                    while bonus_note_lane >= 0x4c:
+                        if output_data[measure_idx][bonus_note_lane][beat_idx] != 0:
+                            bonus_note_lane -= 1
+                            continue
 
-    chart_data = generate_metadata_fields(metadata, orig_chart_data, params.get('dtx_fake_timesigs', False))
-    chart_data = generate_measure_beat_for_chart(chart_data)
-    chart_data = get_chart_data_by_measure_beat(chart_data)
+                        output_data[measure_idx][bonus_note_lane][beat_idx] = dtx_bonus_mapping[event['data']['note']]
+                        break
 
-    if sound_metadata is not None:
-        sound_metadata['sound_folder'] = params.get('sound_folder', None)
+                    if bonus_note_lane < 0x4c:
+                        print("Couldn't find enough bonus note lanes")
 
-    dtx_info, bpms, sound_files, volumes, pans = generate_dtx_info(chart_data, sound_metadata, game_type)
+        for event in events:
+            longnote_fields = {
+                'd': None,
+                'g': 0x2c,
+                'b': 0x2d,
+                'o': 0x2c,
+                'g1': 0x2c,
+                'g2': 0x2d,
+            }[game_type]
 
-    dtx_info = downscale_beat_division_dtx_chart(dtx_info)
-
-    #Hardcode movie sub-folder path here
-    movie_sub_folder = "../movies/"
-
-    output = []
-    if 'title' in orig_chart_data['header']:
-        output.append("#TITLE %s" % orig_chart_data['header']['title'])
-    else:
-        output.append("#TITLE (no title)")
-
-    if 'artist' in orig_chart_data['header']:
-        output.append("#ARTIST %s" % orig_chart_data['header']['artist'])
-    else:
-        output.append("#ARTIST (no artist)")
-
-    if 'level' in orig_chart_data['header']:
-        for k in orig_chart_data['header']['level']:
-            level_map = {
-                "drum": "DLEVEL",
-                "guitar": "GLEVEL",
-                "open": "GLEVEL",
-                "bass": "BLEVEL"
-            }
-            output.append("#%s %s" % (level_map[k], orig_chart_data['header']['level'][k]))
-
-    if 'level' in orig_chart_data['header']:
-        has_drum = "drum" in orig_chart_data['header']['level']
-        has_guitar = "guitar" in orig_chart_data['header']['level']
-        has_bass = "bass" in orig_chart_data['header']['level']
-        has_open = "open" in orig_chart_data['header']['level']
-        if has_drum:
-            output.append("#PREVIEW i%04ddm.wav" % orig_chart_data['header']['musicid'])
-        elif has_guitar or has_bass or has_open:
-            output.append("#PREVIEW i%04dgf.wav" % orig_chart_data['header']['musicid'])
-
-    output.append("#PREIMAGE img_jk%04d.png" % orig_chart_data['header']['musicid'])
-
-    if 'movie_filename' in orig_chart_data['header']:
-        output.append("#AVIZZ %s" % (movie_sub_folder + orig_chart_data['header']['movie_filename']))
-    else:
-        output.append("#AVIZZ mv%04d.avi" % orig_chart_data['header']['musicid'])
-    
-    output.append("#BPM %s" % (bpms[0]))
-    for i in range(0, len(bpms)):
-        output.append("#BPM%s %s" % (base_repr(i+1, 36, padding=2).upper()[-2:], bpms[i]))
-
-    for k in sorted(sound_files.keys()):
-        wav_filename = "%04x.wav" % sound_files[k]
-
-        if sound_metadata and 'entries' in sound_metadata:
-            for sound_entry in sound_metadata['entries']:
-                if sound_entry['sound_id'] != sound_files[k]:
-                    continue
-
-                if "NoFilename" not in sound_entry['flags']:
-                    wav_filename = "%s.wav" % sound_entry['filename']
-
-                if sound_entry.get('clipped', False):
-                    wav_filename = "_override_clipped_%d_%s" % (sound_entry['sound_id'], wav_filename)
-
+            if not longnote_fields:
                 break
 
-        output.append("#WAV%s %s" % (base_repr(int(k), 36, padding=2).upper()[-2:], wav_filename))
+            if event['name'] == "_note_start":
+                measure_idx, beat_idx = get_nearest_beat(mapping, event['timestamp_ms'])
+                output_data[measure_idx][longnote_fields][beat_idx] = 0x01
 
-    bgm_filename = "bgm.wav"
-    if 'level' in orig_chart_data['header']:
-        has_drum = "drum" in orig_chart_data['header']['level']
-        has_guitar = "guitar" in orig_chart_data['header']['level']
-        has_bass = "bass" in orig_chart_data['header']['level']
+            elif event['name'] == "_note_release":
+                measure_idx, beat_idx = get_nearest_beat(mapping, event['timestamp_ms'])
 
-        bgm_filename_part = "".join([
-            "d" if not has_drum else "_",
-            "g" if not has_guitar else "_",
-            "b" if not has_bass else "_",
-            "k"
-        ])
+                check_events = {
+                    'g': guitar_range,
+                    'b': bass_range,
+                    'o': guitar_range,
+                    'g1': guitar_range,
+                    'g2': bass_range,
+                }[game_type]
 
-        if bgm_filename_part == "__bk":
-            # A BGM file with just the bass doesn't exist
-            # Default to one without bass or guitar
-            bgm_filename_part = "d__k"
+                while True:
+                    updated = False
 
-        bgm_filename = "bgm%04d%s.wav" % (orig_chart_data['header']['musicid'],
-                                          bgm_filename_part)
+                    for check_event in check_events:
+                        if measure_idx not in output_data or check_event not in output_data[measure_idx]:
+                            continue
 
-    output.append("#WAVZZ %s" % bgm_filename)
+                        if output_data[measure_idx][check_event][beat_idx] != 0:
+                            if beat_idx == 0:
+                                measure_idx -= 1
+                                beat_idx = division
 
-    for k in sorted(volumes.keys()):
-        output.append("#VOLUME%s %d" % (base_repr(int(k), 36, padding=2).upper()[-2:], volumes[k]))
+                            beat_idx -= 1
+                            updated = True
+                            break
 
-    for k in sorted(pans.keys()):
-        output.append("#PAN%s %d" % (base_repr(int(k), 36, padding=2).upper()[-2:], pans[k]))
+                    if not updated:
+                        if measure_idx not in output_data:
+                            output_data[measure_idx] = {
+                                longnote_fields: [0x00] * division, # Long note
+                            }
 
-    output.append("#00001: ZZ")
-    output.append("#00054: ZZ")
-    for measure in sorted(dtx_info.keys(), key=lambda x: int(x)):
-        for key in sorted(dtx_info[measure].keys(), key=lambda x: int(x)):
-            output.append("#%03d%02X: %s" % (measure, key, "".join(dtx_info[measure][key])))
+                        output_data[measure_idx][longnote_fields][beat_idx] = 0x01
+                        break
 
-    return "\n".join(output)
-
-
-def get_metadata_chart(charts):
-    chart_metadata = [x for x in charts if x['header']['is_metadata'] == 1]
-
-    if len(chart_metadata) == 0:
-        raise Exception("Couldn't find metadata chart")
-
-    return chart_metadata[0]
-
-
-def get_charts_data(charts, sound_metadata, params):
-    chart_metadata = get_metadata_chart(charts)
-
-    return [{
-        'chart': x,
-        'data': generate_dtx_chart_from_json(copy.deepcopy(chart_metadata), x, sound_metadata, params)
-    } for x in charts if x['header']['is_metadata'] == 0]
+        return {
+            'data': simplify_measures(output_data),
+            'sound_ids': used_sound_ids,
+            'bpms': bpm_list,
+            'sound_info': sound_info,
+        }
 
 
-def create_dtx_from_json(params):
-    dtx_data = params.get('input', None)
-    sound_folder = params.get('sound_folder', None)
-    json_dtx = json.loads(dtx_data)
+    output_json = {}
 
-    output_folder = params.get('output', None)
-    if output_folder and not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+    input_json = json.loads(params['input'])
+    output_folder = params.get('output', "")
 
-    sound_metadata = params.get('sound_metadata', None)
-
-    charts_data = get_charts_data(json_dtx['charts'], sound_metadata, params)
-    create_dtx_files(json_dtx, params, charts_data)
-    create_set_definition_file(json_dtx, params, charts_data)
-
-    return None
-
-
-def get_dtx_filename(json_dtx, chart):
-    if 'format' in json_dtx:
-        origin_format = "_%s" % json_dtx['format'].lower()
+    if 'format' in input_json:
+        origin_format = "_%s" % input_json['format'].lower()
     else:
         origin_format = ""
 
-    difficulty = ['nov', 'bsc', 'adv', 'ext', 'mst'][chart['chart']['header']['difficulty']]
-    game_initial = ['d', 'g', 'b', 'o'][chart['chart']['header']['game_type']]
-    output_filename = "%s%04d_%s%s.dtx" % (game_initial,
-                                           json_dtx['musicid'],
-                                           difficulty,
-                                           origin_format)
+    for chart in input_json['charts']:
+        difficulty = ['nov', 'bsc', 'adv', 'ext', 'mst'][chart['header']['difficulty']]
+        game_initial = ['d', 'g', 'b', 'o', 'g1', 'g2'][chart['header']['game_type']]
+        sound_initial = ['drum', 'guitar', 'guitar', 'guitar', 'guitar', 'guitar'][chart['header']['game_type']]
+        bgm_filename = ['_gbk.wav', 'd_bk.wav', 'dg_k.wav', 'd_bk.wav', 'd_bk.wav', 'd_bk.wav'][chart['header']['game_type']]
 
-    return output_filename
+        output_data = generate_output_data(chart, game_initial)
 
-
-def create_dtx_files(json_dtx, params, charts_data):
-    output_folder = params.get('output', None)
-
-    for x in charts_data:
-        output_filename = get_dtx_filename(json_dtx, x)
-
-        if output_folder:
-            output_filename = os.path.join(output_folder, output_filename)
-
-        with open(output_filename, "w", encoding="shift-jis") as f:
-            f.write(x['data'])
+        output_filename = "%s_%04d_%s%s.dtx" % (game_initial,
+                                            input_json.get('musicid', 0),
+                                            difficulty,
+                                            origin_format)
 
 
-def create_set_definition_file(json_dtx, params, charts_data):
-    output_folder = params.get('output', "")
-    output_set_filename = os.path.join(output_folder, "set.def")
+        print("Saving", output_filename)
+        output_filename = os.path.join(output_folder, output_filename)
 
-    song_title = None
-    label_array = ['BASIC','ADVANCED','EXTREME','MASTER']
-    output_set_data = {}
-    for x in charts_data:
-        output_filename = get_dtx_filename(json_dtx, x)
+        with open(output_filename, "w") as outfile:
+            outfile.write("""#TITLE: (no title)
+#ARTIST: (no artist)
+#DLEVEL: 1
+#GLEVEL: 1
+#BLEVEL: 1\n""")
 
-        game_type = ['Drum', 'Guitar', 'Bass', 'Open'][x['chart']['header']['game_type']]
-        if game_type not in output_set_data:
-            output_set_data[game_type] = {}
 
-        output_set_data[game_type][x['chart']['header']['difficulty']] = output_filename
+            comment_json = {
+                'sound_lengths': {}
+            }
 
-        if 'title' in x['chart']['header']:
-            song_title = x['chart']['header']['title']
+            for k in output_data['sound_ids']:
+                if output_data['sound_ids'][k]['duration']:
+                    comment_json['sound_lengths'][k] = output_data['sound_ids'][k]['duration']
 
-    with open(output_set_filename, "a", encoding="shift-jis") as outfile:
-        for part in output_set_data:
-            if song_title:
-                #outfile.write("#TITLE: {} ({})\n".format(song_title, part))
-                outfile.write("#TITLE: {}\n".format(song_title))
+            if comment_json['sound_lengths']:
+                outfile.write("#COMMENT %s\n" % json.dumps(comment_json))
 
-            for difficulty in sorted(output_set_data[part].keys(), key=lambda x: int(x)):
-                outfile.write("#L{}LABEL: {}\n".format(difficulty,
-                                                      label_array[difficulty - 1]))
-                outfile.write("#L{}FILE: {}\n".format(difficulty,
-                                                      output_set_data[part][difficulty]))
-            outfile.write("\n")
+            sound_metadata = params.get('sound_metadata', None)
+            for k in sorted(output_data['sound_info'].keys()):
+                wav_filename = "%s_%04x.wav" % (sound_initial[0], output_data['sound_ids'][output_data['sound_info'][k]['sound_id']]['sound_id'])
+
+                outfile.write("#WAV%s: %s\n" % (base_repr(k, 36, padding=2).upper()[-2:], wav_filename))
+                outfile.write("#VOLUME%s: %d\n" % (base_repr(k, 36, padding=2).upper()[-2:], round((output_data['sound_info'][k]['volume'] / 127) * 100)))
+            #     output.append("#PAN%s %d" % (base_repr(int(k), 36, padding=2).upper()[-2:], output_data['sound_info'][k]['pan']))
+
+
+            sound_initial = ""
+            outfile.write("""#WAVZZ: %s
+#00001: ZZ
+#000C2: 02\n""" % (os.path.join(sound_initial, bgm_filename)))
+
+            outfile.write("#BPM %f\n" % output_data['bpms'][0])
+            for i, bpm in enumerate(output_data['bpms']):
+                outfile.write("#BPM%s %f\n" % (base_repr(i + 1, 36, padding=2).upper()[-2:], output_data['bpms'][i]))
+
+
+            for measure_idx in output_data['data']:
+                for eidx in output_data['data'][measure_idx]:
+                    if eidx == 0x02:
+                        outfile.write("#%03d%02X: %f\n" % (measure_idx, eidx, output_data['data'][measure_idx][eidx]))
+
+                    else:
+                        outfile.write("#%03d%02X: %s\n" % (measure_idx, eidx, "".join([convert_base36(x, 2) for x in output_data['data'][measure_idx][eidx]])))
 
 
 class DtxFormat:
@@ -2783,7 +1249,6 @@ class DtxFormat:
 
     @staticmethod
     def is_format(filename):
-        # How to determine a DTX?
         return False
 
 
